@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# Secrets and local overrides
+.env
+.env.local
+.env.*.local
+
+# Local database state (used by the sandbox/dev bootstrap scripts)
+.pgdata/
+.pglog/
+
+.DS_Store
+*.log
