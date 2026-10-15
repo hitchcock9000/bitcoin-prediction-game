@@ -14,6 +14,7 @@ export interface AppConfig {
   databaseSsl: boolean;
   playerCookieSecret: string;
   cookieSecure: boolean;
+  cookieSameSite: 'Lax' | 'Strict' | 'None';
   priceProvider: PriceProviderKind;
   coinbaseApiBase: string;
   priceFetchTimeoutMs: number;
@@ -51,6 +52,18 @@ export function loadConfig(env: EnvSource = process.env): AppConfig {
     );
   }
 
+  const cookieSecure = env.COOKIE_SECURE ? env.COOKIE_SECURE === 'true' : isProduction;
+
+  const cookieSameSite = (env.COOKIE_SAME_SITE ?? 'Lax') as 'Lax' | 'Strict' | 'None';
+  if (!['Lax', 'Strict', 'None'].includes(cookieSameSite)) {
+    throw new ConfigurationError('COOKIE_SAME_SITE must be one of: Lax, Strict, None.');
+  }
+  if (cookieSameSite === 'None' && !cookieSecure && isProduction) {
+    throw new ConfigurationError(
+      'COOKIE_SAME_SITE=None requires COOKIE_SECURE=true; browsers reject the cookie otherwise.',
+    );
+  }
+
   const priceProvider = (env.PRICE_PROVIDER ?? 'coinbase') as PriceProviderKind;
   if (priceProvider !== 'coinbase' && priceProvider !== 'simulated') {
     throw new ConfigurationError(`PRICE_PROVIDER must be "coinbase" or "simulated", got "${priceProvider}".`);
@@ -73,7 +86,12 @@ export function loadConfig(env: EnvSource = process.env): AppConfig {
     playerCookieSecret,
     // Secure cookies by default in production; overridable so a plain-HTTP
     // preview can still hand out a session cookie.
-    cookieSecure: env.COOKIE_SECURE ? env.COOKIE_SECURE === 'true' : isProduction,
+    cookieSecure,
+    // 'Lax' is the right default: the game is a top-level page and the API is
+    // same-origin. 'None' exists only for deployments that embed the app in an
+    // iframe on another site, where Lax cookies are treated as third-party and
+    // dropped. It requires Secure.
+    cookieSameSite,
     priceProvider,
     coinbaseApiBase: env.COINBASE_API_BASE ?? 'https://api.exchange.coinbase.com',
     priceFetchTimeoutMs: Number(env.PRICE_FETCH_TIMEOUT_MS ?? 4000),

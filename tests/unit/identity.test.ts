@@ -4,6 +4,7 @@ import {
   isPlayerId,
   PLAYER_COOKIE_NAME,
   readCookie,
+  serializePlayerCookie,
   signPlayerToken,
   verifyPlayerToken,
 } from '@/server/identity';
@@ -110,5 +111,30 @@ describe('readCookie', () => {
 
   it('does not confuse similarly named cookies', () => {
     expect(readCookie(`not_${PLAYER_COOKIE_NAME}=x`, PLAYER_COOKIE_NAME)).toBeNull();
+  });
+});
+
+describe('serializePlayerCookie', () => {
+  const token = 'abc.def.ghi';
+
+  it('always sets HttpOnly, Path and a SameSite policy', () => {
+    const cookie = serializePlayerCookie(token, { secure: false });
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Path=/');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).toContain('Max-Age=');
+    expect(cookie).not.toContain('Secure');
+  });
+
+  it('adds Secure when configured', () => {
+    expect(serializePlayerCookie(token, { secure: true })).toContain('; Secure');
+  });
+
+  it('supports SameSite=None for iframe-embedded deployments', () => {
+    // Lax cookies are dropped when the app runs inside a third-party iframe,
+    // which would silently break player identity in an embedded preview.
+    const cookie = serializePlayerCookie(token, { secure: true, sameSite: 'None' });
+    expect(cookie).toContain('SameSite=None');
+    expect(cookie).toContain('Secure');
   });
 });

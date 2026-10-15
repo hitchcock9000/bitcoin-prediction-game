@@ -196,6 +196,36 @@ export function createGameStore(pool: Pool) {
       };
     },
 
+    /** Liveness probe for the health endpoint. */
+    async ping(): Promise<boolean> {
+      try {
+        await pool.query('select 1');
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    /**
+     * Operational counters. Deliberately a cheap aggregate: on a deployment
+     * this size it is enough to answer "is anything stuck?" without metrics
+     * infrastructure.
+     */
+    async getPendingStats(): Promise<{ pending: number; oldestPendingAgeSeconds: number | null }> {
+      const { rows } = await pool.query(
+        `select count(*)::int as pending,
+                max(extract(epoch from (now() - created_at))) as oldest_age_seconds
+           from predictions
+          where status = 'pending'`,
+      );
+      const row = rows[0] ?? { pending: 0, oldest_age_seconds: null };
+      return {
+        pending: Number(row.pending),
+        oldestPendingAgeSeconds:
+          row.oldest_age_seconds === null ? null : Math.floor(Number(row.oldest_age_seconds)),
+      };
+    },
+
     /**
      * Pending predictions whose 60 seconds have elapsed.
      *

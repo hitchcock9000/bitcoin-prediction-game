@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.gitignore
+coverage
+*.log
+.env
+.env.*
+!.env.example
+.pgdata
+.pglog
+README.md
+DECISIONS.md
+WALKTHROUGH.md
+AGENTS.md
+tests
+.github

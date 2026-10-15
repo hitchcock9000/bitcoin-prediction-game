@@ -101,13 +101,28 @@ export function readCookie(cookieHeader: string | null | undefined, name: string
   return null;
 }
 
-export function playerCookieOptions(secure: boolean, now: Date = new Date()) {
-  return {
-    httpOnly: true,
-    sameSite: 'lax' as const,
-    secure,
-    path: '/',
-    maxAge: Math.floor(PLAYER_TOKEN_TTL_MS / 1000),
-    expires: new Date(now.getTime() + PLAYER_TOKEN_TTL_MS),
-  };
+/**
+ * Serialises the `Set-Cookie` header by hand.
+ *
+ * A cookie library would be a dependency for six attributes, and doing it
+ * explicitly keeps the security-relevant ones (`HttpOnly`, `SameSite`, `Secure`)
+ * visible in the code rather than hidden behind defaults.
+ */
+export function serializePlayerCookie(
+  token: string,
+  options: { secure: boolean; sameSite?: 'Lax' | 'Strict' | 'None'; now?: Date },
+): string {
+  const now = options.now ?? new Date();
+  const parts = [
+    `${PLAYER_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `SameSite=${options.sameSite ?? 'Lax'}`,
+    `Max-Age=${Math.floor(PLAYER_TOKEN_TTL_MS / 1000)}`,
+    `Expires=${new Date(now.getTime() + PLAYER_TOKEN_TTL_MS).toUTCString()}`,
+  ];
+  // Secure cookies are not sent over plain HTTP, so this is only omitted when
+  // explicitly configured for an HTTP preview.
+  if (options.secure) parts.push('Secure');
+  return parts.join('; ');
 }

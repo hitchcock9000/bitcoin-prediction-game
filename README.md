@@ -10,10 +10,11 @@ requests arrive at once, the price feed is down, the server restarts halfway
 through a round. The server owns the game state; the browser only asks what to
 show next.
 
-> **Status.** Backend, database schema, settlement engine and test suite are
-> implemented and verified. The UI and the public deployment are in progress —
-> see [Current status](#current-status). Nothing in this README describes
-> behaviour that has not been run.
+> **Status.** The complete game — schema, settlement engine, HTTP API and UI — is
+> implemented and verified locally, including the full loop end to end. The
+> public deployment and the repository publication are the remaining steps. See
+> [Current status](#current-status). Nothing in this README describes behaviour
+> that has not been run.
 
 ---
 
@@ -21,6 +22,8 @@ show next.
 
 - [Current status](#current-status)
 - [Core functionality](#core-functionality)
+- [HTTP API](#http-api)
+- [UI states](#ui-states)
 - [Requirements and acceptance criteria](#requirements-and-acceptance-criteria)
 - [Ambiguities and assumptions](#ambiguities-and-assumptions)
 - [Tech stack](#tech-stack)
@@ -48,9 +51,12 @@ show next.
 | Game service (creation, state) | Implemented, tested |
 | Price providers (Coinbase + simulated) | Implemented, parser tested against a captured live payload |
 | Player identity (signed cookie) | Implemented, tested |
-| HTTP API | Not yet implemented |
-| UI | Not yet implemented |
+| HTTP API (`state`, `predictions`, `settle`, `health`) | Implemented, tested at HTTP level |
+| UI (all eight states) | Implemented, served from the production build |
+| Scheduler in the production process | Verified in `node .next/standalone/server.js` |
+| Full game loop over HTTP | Verified end to end (`scripts/smoke.mjs`, 14/14 checks) |
 | Public deployment | Not yet done — no URL is claimed |
+| Repository published | Not yet done — branch pushed, PR open |
 
 ---
 
@@ -68,6 +74,45 @@ show next.
 
 Settlement is driven by the server on a timer. It does not depend on the browser
 remaining open, and it survives restarts.
+
+### HTTP API
+
+| Endpoint | Purpose | Notes |
+| --- | --- | --- |
+| `GET /api/state` | Score, latest price, open prediction, last result | Issues a signed player cookie on first contact |
+| `POST /api/predictions` | Place a prediction | Body is `{"direction":"up"\|"down"}`; **everything else is ignored** |
+| `POST /api/settle` | Run one settlement sweep | Requires `SETTLEMENT_SECRET`; disabled (404) when unset |
+| `GET /api/health` | DB, provider and scheduler status | 503 when the database is unreachable |
+
+Status codes: `201` created, `400` malformed direction, `409` already has an open
+prediction (the body includes the current state so the UI can resync), `503` the
+price feed is unavailable, `401`/`404` on the settle endpoint. All responses are
+`cache-control: no-store`.
+
+The prediction request body is the whole attack surface from the client's side:
+the player says *up* or *down* and nothing else. There is no code path that reads
+a player id, score, price or timestamp from a request, which is why "the client
+cannot influence an outcome" is a structural property rather than a validation
+rule that could be forgotten.
+
+### UI states
+
+Eight states, each rendered explicitly so a player is never left guessing:
+
+| State | Treatment |
+| --- | --- |
+| Initial loading | Placeholder, `aria-busy` |
+| Ready | Price with its timestamp, score, two buttons |
+| Submitting | Button shows "Placing…", both disabled |
+| Pending | Entry price, entry time, countdown, and a sentence explaining the wait |
+| Won / Lost | Result card with entry price, settlement price, ±1, resolved time |
+| Price unavailable | Price slot says so, predictions paused, score still visible |
+| Recoverable error | Inline banner with a retry, last known state stays on screen |
+| Simulated prices | Persistent "Demo mode" banner naming the provider |
+
+The countdown is seeded from the server's `secondsRemaining` on every poll and
+ticked locally in between. It is decoration: it triggers nothing and a wrong
+client clock cannot change a result.
 
 ---
 
@@ -111,6 +156,9 @@ remaining open, and it survives restarts.
 - [x] Incorrect predictions subtract one point
 - [x] Scores persist in PostgreSQL
 - [x] Settlement cannot update the score twice (repeated and concurrent settlement tested)
+- [x] UI states implemented and served from the production build
+- [x] Full game loop verified over HTTP (`scripts/smoke.mjs`, 14/14)
+- [x] Scheduler verified in the production process, and restart recovery demonstrated
 - [ ] Publicly accessible deployment ← *pending, needs deployment credentials*
 - [x] Repository is public
 - [x] README, DECISIONS.md and WALKTHROUGH.md reflect the implementation
@@ -154,6 +202,7 @@ these change the stated rules; they fill gaps the rules leave open.
 | Market data | Coinbase Exchange public API | Real BTC/USD with a provider timestamp and trade id — see [D2](DECISIONS.md) |
 | Tests | Vitest, against a real PostgreSQL | The guarantees are database behaviour — see [D15](DECISIONS.md) |
 | Hosting | Long-running container (Railway / Render) | The settlement scheduler needs a process that stays alive — see [D3](DECISIONS.md) |
+| Client bundle | 105 kB first load | No UI framework, no chart library |
 
 ### Why not AWS
 
@@ -418,6 +467,49 @@ npm test            # vitest: unit + integration
 npm run test:unit   # no database required
 ```
 
+### What has been run, and what it reported
+
+| Command | Result |
+| --- | --- |
+| `npm run typecheck` | clean |
+| `npm run lint` | 0 errors, 0 warnings |
+| `npm test` | **160 tests passing** across 10 files |
+| `npm run build` | production build succeeds (105 kB first load) |
+| `node scripts/smoke.mjs --expect-simulated` | **14/14 checks** (full journey over HTTP) |
+
+Test layout:
+
+| File | What it covers |
+| --- | --- |
+| `tests/unit/rules.test.ts` | The settlement policy: all four win/loss combinations, the exact 60s boundary, unchanged price, stale/future quotes, provider failure, quote ordering |
+| `tests/unit/decimal.test.ts` | Exact decimal comparison, including cases a float would get wrong |
+| `tests/unit/coinbase.test.ts` | Response parsing against a **captured live payload**, plus every rejection case |
+| `tests/unit/identity.test.ts` | Cookie signing, tampering, expiry, `Set-Cookie` attributes |
+| `tests/unit/config.test.ts` | Configuration guard rails, including simulated prices in production |
+| `tests/unit/cachedProvider.test.ts` | Display-price cache TTL and stale-on-error bounds |
+| `tests/unit/view.test.ts` | Response mapping, price normalisation, countdown arithmetic |
+| `tests/integration/store.test.ts` | Database invariants: 20 concurrent creations, 10 concurrent settlements, each `CHECK` constraint |
+| `tests/integration/game-loop.test.ts` | Create → settle over the real store, restart recovery, returning players, racing sweeps |
+| `tests/integration/http.test.ts` | HTTP semantics: cookies, forgery, 409/503/400/401 handling, state recovery |
+
+### End-to-end verification against a running server
+
+```bash
+npm run build && npm run standalone:prepare
+node --env-file=.env .next/standalone/server.js &
+node scripts/smoke.mjs --expect-simulated
+```
+
+The smoke script drives the entire journey over real HTTP and takes ~70 seconds,
+because the 60-second rule is real. It is deliberately not part of the unit suite
+for that reason.
+
+**Restart recovery, as demonstrated:** create a prediction → kill the server
+before its window elapses → wait past the deadline with the process down → confirm
+the row is still `pending` in the database → restart. The boot sweep settles it
+immediately, the score moves exactly once, and the same cookie can play again.
+Nothing lives in process memory.
+
 Integration tests need a real PostgreSQL. A local one, or Docker:
 
 ```bash
@@ -437,11 +529,88 @@ npm run ci          # typecheck + lint + tests + production build
 
 ## Deployment
 
-Not yet deployed, so no URL is claimed. The intended shape and the exact steps
-are documented in the deployment section of `WALKTHROUGH.md` once verified. The
-short version: a container host with managed PostgreSQL, `DATABASE_URL` and
-`PLAYER_COOKIE_SECRET` set as secrets, and the migration runner executed on
-release.
+**Not yet deployed, so no public URL is claimed here.** Everything needed is in
+the repository and the steps below have been exercised locally in production
+mode; only the account-specific part remains.
+
+### Target shape
+
+A **long-running container** plus **managed PostgreSQL**. The container must
+stay alive between requests, because the settlement scheduler lives in the
+process ([D3](DECISIONS.md)).
+
+```mermaid
+flowchart LR
+  U[Browser] -->|HTTPS| H["Container host<br/>node server.js<br/>(web + scheduler)"]
+  H -->|DATABASE_URL| PG[("Managed PostgreSQL")]
+  H -->|entry + settlement quotes| CB[Coinbase Exchange]
+  CRON["optional external cron<br/>POST /api/settle"] -.->|SETTLEMENT_SECRET| H
+```
+
+### Files
+
+- `Dockerfile` — multi-stage build running the standalone bundle as a non-root
+  user, with a `HEALTHCHECK` against `/api/health`. *(The command it runs was
+  verified locally; `docker build` itself was not, because no Docker daemon was
+  available in the development environment.)*
+- `railway.json` / any equivalent — not committed, because the configuration is
+  provider form fields rather than code.
+
+### Steps (Railway or Render; both are equivalent)
+
+1. Create a PostgreSQL instance and copy its connection string.
+2. Create a service from this repository. It detects the `Dockerfile`.
+3. Set environment variables (secrets, not committed):
+
+   | Variable | Value |
+   | --- | --- |
+   | `DATABASE_URL` | from step 1 (add `DATABASE_SSL=true` if required) |
+   | `PLAYER_COOKIE_SECRET` | `openssl rand -base64 48` |
+   | `PRICE_PROVIDER` | `coinbase` (the default; do not set `simulated`) |
+   | `SETTLEMENT_SECRET` | optional, enables the external settle endpoint |
+
+4. Run migrations once per deployment, before starting the app:
+
+   ```bash
+   node scripts/migrate.mjs        # inside the container, or from a release shell
+   ```
+
+5. Deploy, then verify (below).
+
+### Post-deployment verification checklist
+
+Run these against the public URL and read the output — not the dashboard.
+
+```bash
+# 1. Health: database up, provider named, scheduler running in this process
+curl -s https://<host>/api/health | jq .
+
+# 2. Full journey over HTTP: cookie, entry, duplicate rejection, settlement, score
+node scripts/smoke.mjs --base-url https://<host>
+
+# 3. Confirm it is NOT serving simulated prices
+curl -s https://<host>/api/health | jq '.priceProvider'
+#    expect: { "name": "coinbase-exchange:BTC-USD", "simulated": false }
+
+# 4. In a browser: place a prediction, close the tab, reopen after a minute.
+#    The score must have changed with no page open in between.
+
+# 5. Restart the service mid-round and confirm the prediction still settles.
+```
+
+If step 2 or 3 fails, the deployment is not working regardless of what the
+dashboard shows.
+
+### Reliability notes for the operator
+
+- Keep **one instance**. Multiple instances are safe (settlement is idempotent,
+  [D4](DECISIONS.md)) but each one polls the price feed; disable the scheduler on
+  the others with `SETTLEMENT_SCHEDULER_ENABLED=false`.
+- On a host that suspends idle containers (free tiers), predictions settle late
+  while suspended. Schedule a cron hitting `POST /api/settle` with
+  `x-settlement-secret` to bound that, or run a paid always-on instance.
+- `GET /api/health` exposes pending count and oldest pending age — useful for
+  spotting a stuck market or a stalled scheduler.
 
 ---
 
@@ -470,6 +639,15 @@ Honest list; the reasoning is in [DECISIONS.md](DECISIONS.md).
   cannot span tables). A reconciliation query is documented rather than a
   trigger implemented.
 - **No leaderboard or history UI.** Not requested.
+- **UI interactions were not driven by a real browser engine** in the development
+  environment (none available). The UI is verified by serving the production
+  build, checking the rendered HTML and static assets, and exercising every
+  endpoint it calls over HTTP — including the whole loop with cookies. Focus
+  handling and hydration warnings have not been observed directly; a jsdom or
+  Playwright component test is the next step.
+- **The Docker image was not built.** The command the image runs
+  (`node .next/standalone/server.js`) was verified directly, but no Docker daemon
+  was available to run `docker build`.
 
 ## Next improvements
 

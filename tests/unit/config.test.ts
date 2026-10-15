@@ -51,6 +51,24 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...BASE_ENV, NODE_ENV: 'production', COOKIE_SECURE: 'false' }).cookieSecure).toBe(false);
   });
 
+  it('validates the cookie SameSite policy', () => {
+    expect(() => loadConfig({ ...BASE_ENV, COOKIE_SAME_SITE: 'Sometimes' })).toThrow(/Lax, Strict, None/);
+    expect(loadConfig({ ...BASE_ENV, COOKIE_SAME_SITE: 'None', COOKIE_SECURE: 'true' }).cookieSameSite).toBe('None');
+  });
+
+  it('refuses SameSite=None without Secure in production', () => {
+    // Browsers reject SameSite=None without Secure, so this would produce a
+    // cookie that is silently never stored.
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        NODE_ENV: 'production',
+        COOKIE_SAME_SITE: 'None',
+        COOKIE_SECURE: 'false',
+      }),
+    ).toThrow(/requires COOKIE_SECURE=true/);
+  });
+
   it('leaves the external settlement secret unset unless provided', () => {
     expect(loadConfig({ ...BASE_ENV }).settlementSecret).toBeNull();
     expect(loadConfig({ ...BASE_ENV, SETTLEMENT_SECRET: 'trigger-me' }).settlementSecret).toBe('trigger-me');

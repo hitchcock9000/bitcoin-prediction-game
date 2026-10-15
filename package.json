@@ -17,7 +17,9 @@
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
     "db:migrate": "node --env-file-if-exists=.env scripts/migrate.mjs",
-    "ci": "npm run typecheck && npm run lint && npm run test && npm run build"
+    "ci": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "standalone:prepare": "node scripts/prepare-standalone.mjs",
+    "start:standalone": "node .next/standalone/server.js"
   },
   "dependencies": {
     "next": "15.5.4",

@@ -545,6 +545,188 @@ than a failing one.
 
 ---
 
+## D16 — Route handlers are plain `Request → Response` functions
+
+**Context.** The API could have been written as Next.js route handlers that use
+`next/headers` for cookies, or as functions that take a `Request`. The former is
+more idiomatic; the latter is testable without a framework context.
+
+**Decision.** All handler logic lives in `src/server/http/handlers.ts` as
+`handleState(request: Request): Promise<Response>` and friends. The files under
+`src/app/api/**/route.ts` are deliberately two lines: import the runtime, delegate.
+Cookies are read from the `Cookie` header and written with `Set-Cookie`, rather
+than through `next/headers`.
+
+**Reason.** The properties worth testing here are HTTP semantics — status codes,
+`Set-Cookie` attributes, error bodies — and testing them should not require
+booting a server or standing inside a framework's async request context. As a
+side effect, the handlers have no Next.js import at all, so the same code is
+portable and the framework is confined to the wrapper files.
+
+**Alternative considered.** Using `next/headers` to read and set cookies. It is
+shorter and gives framework-managed cookie merging, but it makes the tests depend
+on framework internals, and there is exactly one cookie in this application.
+
+**Trade-off.** The `Set-Cookie` header is serialised by hand
+(`serializePlayerCookie`), so the security-relevant attributes are our
+responsibility. That is arguably an advantage for review — `HttpOnly`,
+`SameSite` and `Secure` are explicit in the code — but it does mean a cookie
+library is not doing the escaping. `tests/unit/identity.test.ts` pins the output.
+
+**Files.** `src/server/http/handlers.ts`, `src/app/api/**/route.ts`,
+`src/server/identity.ts`.
+
+---
+
+## D17 — The displayed price is cached; entry and settlement prices never are
+
+**Context.** The browser polls the game state every few seconds, and each poll
+wants a price. Without a cache, N players polling every 3 seconds is N/3 upstream
+requests per second, which reaches exchange rate limits long before anything else
+in this system breaks.
+
+**Decision.** `createCachedPriceProvider` wraps the live provider with a 2-second
+TTL, and is injected **only** as `displayProvider` in the HTTP runtime. Entry
+prices (`service.submitPrediction`) and settlement prices
+(`runSettlementSweep` → `settlementProvider`) always call the live provider.
+
+**Reason.** A price that decides points must never come from a cache, and a price
+that is merely rendered may. Making that a distinct, named dependency — two
+provider references in `HandlerDeps` rather than one plus a `useCache` flag —
+means authority is visible in the wiring instead of being a runtime decision.
+
+**Behaviour on failure.** A quote cached within the last 30 seconds is served
+through a momentary provider outage, so a blip does not blank the UI. Beyond
+that the error propagates, because presenting a minutes-old price as "the latest
+price" would mislead. Both bounds are configurable and tested.
+
+**Trade-off.** The displayed price can be up to 2 seconds old, so it may differ
+very slightly from the price a player receives on entry. The recorded entry price
+is shown back to them immediately after the prediction is created, and the game
+compares prices exactly rather than approximately, so this is cosmetic.
+
+**Files.** `src/server/prices/cached.ts`, `src/server/http/runtime.ts`,
+`tests/unit/cachedProvider.test.ts`.
+
+---
+
+## D18 — Cookie `SameSite` is configurable, because iframes break `Lax`
+
+**Context.** The development preview for this project serves the app proxied
+under another site, and embedded in an iframe. A `SameSite=Lax` cookie is treated
+as third-party in that context and can be dropped — which would silently break
+player identity, and would look like a game bug rather than a cookie bug.
+
+**Decision.** `COOKIE_SAME_SITE` selects `Lax` (default), `Strict` or `None`, and
+config validation refuses `None` without `Secure`, because browsers reject
+`SameSite=None` cookies that are not `Secure` — a configuration that would appear
+to succeed and then fail in the browser.
+
+**Alternative considered.** Hard-coding `SameSite=Lax`. It is the better default
+and correct for a normal top-level deployment, which is why it stays the default,
+but it makes an embedded preview untestable for a reason that has nothing to do
+with the game.
+
+**Trade-off.** One more configuration knob, and a reader has to know when `None`
+is appropriate. The validation error message states the rule, and README lists the
+variable with its rationale.
+
+**Files.** `src/server/config.ts`, `src/server/identity.ts`,
+`tests/unit/config.test.ts`.
+
+---
+
+## D19 — Run the standalone build, and verify that artifact
+
+**Context.** `next.config.ts` sets `output: 'standalone'` for a slim container.
+`next start` warns that it "does not work with `output: 'standalone'`", which is a
+misleading message — it does work, but it is not the supported path, and the
+standalone server is not runnable immediately after `next build` because static
+assets are not copied into the bundle.
+
+**Decision.** `scripts/prepare-standalone.mjs` completes the build (copies
+`.next/static`, `public/`, the migration runner and `migrations/`), exposed as
+`npm run standalone:prepare`. The running application in this environment — the
+one used for all production-mode verification — is
+`node .next/standalone/server.js`, which is also `CMD` in the Dockerfile.
+
+**Reason.** I want to verify the artifact that actually ships. Running `next start`
+for the preview while the Dockerfile ran a different command would mean the
+deployment path was never exercised.
+
+**Trade-off.** `npm run build` alone is no longer sufficient to produce a runnable
+bundle; `standalone:prepare` must follow. That is stated in AGENTS.md, the
+Dockerfile and the README, and the script fails loudly with instructions if
+`.next/standalone` is missing.
+
+**Not verified.** `docker build` itself could not be run in the development
+environment (no Docker daemon). The command the image runs was verified directly;
+the image build is not. That distinction is stated in the Dockerfile header and in
+the README.
+
+**Files.** `scripts/prepare-standalone.mjs`, `Dockerfile`, `package.json`.
+
+---
+
+## D20 — Bug found by the smoke test: `secondsRemaining` reported 61
+
+**Context.** The first end-to-end run against the real server failed one check:
+immediately after creating a prediction, the API reported
+`secondsRemaining: 61` for a rule whose window is 60 seconds.
+
+**Cause.** The deadline is `createdAt + 60s`, where `createdAt` is the
+*database's* clock read during the insert, while the `now` used for the response
+is read by the handler *before* the insert. The difference is at least the insert
+latency, so `ceil()` on a value marginally over 60 rounds up to 61. It was the
+first thing the end-to-end test caught that every unit test had missed, because
+the unit tests supplied `now` and `createdAt` consistently.
+
+**Decision.** Clamp to `RULES.minWaitMs / 1000` with a comment explaining why the
+clamp is correct rather than cosmetic: `createdAt` is necessarily at or after the
+moment the prediction was requested, so the remaining time cannot exceed the
+configured window.
+
+**Alternative considered.** Using `Math.floor` instead of `ceil`. It fixes the 61
+but makes the countdown reach 0 up to a second before the prediction is actually
+eligible, which is its own small lie, and it would break again with a different
+rounding. Clamping is exact and expresses the invariant.
+
+**Trade-off.** A pathological clock difference (app clock far behind the database)
+would be masked instead of surfaced. Bounded and acceptable: the clamp only caps
+the *displayed* countdown, and settlement eligibility is decided from the database
+clock, never from this value.
+
+**Files.** `src/server/http/view.ts`, `tests/unit/view.test.ts`.
+
+---
+
+## D21 — The HTTP contract lives in a types-only module
+
+**Context.** The browser needs the shape of the API responses, but importing the
+server's view module from a client component would risk pulling server code —
+and therefore `pg` — into the client bundle.
+
+**Decision.** `src/shared/api.ts` contains only interfaces: no imports, no runtime
+code. The server's `view.ts` imports from it and re-exports; the client imports
+from it directly.
+
+**Reason.** A single source of truth for the contract (a change to a field name
+breaks the type check on both sides) with zero risk of a server module crossing
+into the browser bundle.
+
+**Verification.** After the production build, the client chunks were grepped for
+`DATABASE_URL`, `PLAYER_COOKIE_SECRET`, `postgresql://`, `entry_trade_id`,
+`SETTLEMENT_SECRET` and `bpg_player`: zero occurrences in any chunk. There are no
+`NEXT_PUBLIC_*` variables in the project.
+
+**Trade-off.** DTO types are hand-written rather than generated from the server
+types, so a field can be added to a record without appearing in the contract —
+which is arguably the point, since the contract should be deliberate.
+
+**Files.** `src/shared/api.ts`, `src/server/http/view.ts`, `src/app/Game.tsx`.
+
+---
+
 ## Open questions / not yet decisions
 
 - **Vertical scaling.** At ~10,000 players the per-tick sweep would need
@@ -557,3 +739,11 @@ than a failing one.
   request volume. See README "Known limitations".
 - **Reconciliation job.** A scheduled check that `players.score` still equals
   the resolved-prediction tally. Not implemented.
+- **Browser-level UI verification.** The UI's states were verified by serving the
+  production build, checking the rendered HTML and assets, and exercising every
+  endpoint it calls over HTTP (including cookie handling and the full loop). No
+  browser engine was driven in the development environment, so interactions like
+  focus management and hydration warnings have not been observed directly. A
+  jsdom or Playwright component test is the obvious next step.
+- **Docker image.** The command the image runs is verified; `docker build` is not
+  (no Docker daemon available). See D19.
