@@ -727,6 +727,42 @@ which is arguably the point, since the contract should be deliberate.
 
 ---
 
+## D22 — Request bodies are bounded, because review found a 2 MB prediction
+
+**Context.** Running adversarial checks against the deployed build, a 2 MB JSON
+body sent to `POST /api/predictions` was accepted with `201 Created`. Next.js
+route handlers do not impose the 1 MB limit that the older Pages API routes had,
+and the handler called `request.json()`, which buffers the entire payload before
+any rule inspects it.
+
+**Decision.** Reject oversized bodies in two places:
+
+1. The declared `Content-Length` is checked **before reading**, so an honest
+   client's large upload is refused without being buffered.
+2. The actual body length is checked after reading, so a request that omits
+   `Content-Length` is still bounded.
+
+The ceiling is 1 KB, which is generous for `{"direction":"up"}`.
+
+**Finding while writing the test.** The first version of this check only looked
+at `Content-Length`, and the test failed — because an in-process `Request` built
+by the test harness does not set that header, and neither does a chunked upload.
+That failure was useful: it exposed that the single-check version would have been
+bypassed in exactly the case it was meant to cover. Hence the second check.
+
+**Honest limitation.** The post-read check bounds what gets *parsed and
+processed*, not what gets buffered. A hard memory bound for chunked uploads
+belongs at the platform proxy, which is where a real deployment enforces it. This
+is stated in the code comment rather than left implied.
+
+**Trade-off.** Two checks instead of one, and a magic number that has to be
+updated if the request shape ever grows. Acceptable: the payload is a single
+enum, and correctness here is cheap.
+
+**Files.** `src/server/http/handlers.ts`, `tests/integration/http.test.ts`.
+
+---
+
 ## Open questions / not yet decisions
 
 - **Vertical scaling.** At ~10,000 players the per-tick sweep would need
@@ -735,8 +771,9 @@ which is arguably the point, since the contract should be deliberate.
   iteration".
 - **Rate limiting.** There is currently no rate limit on `POST /api/predictions`.
   The partial unique index bounds the *damage* (a player can have at most one
-  pending prediction, so they cannot farm predictions), but nothing bounds
-  request volume. See README "Known limitations".
+  pending prediction, so they cannot farm predictions), and request bodies are
+  now bounded (D22), but request *volume* is unbounded. See README
+  "Known limitations".
 - **Reconciliation job.** A scheduled check that `players.score` still equals
   the resolved-prediction tally. Not implemented.
 - **Browser-level UI verification.** The UI's states were verified by serving the

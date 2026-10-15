@@ -631,8 +631,9 @@ Honest list; the reasoning is in [DECISIONS.md](DECISIONS.md).
   player at zero; nothing prevents creating several identities. Scores are
   therefore not trustworthy as a competitive ranking — see [D9](DECISIONS.md).
 - **No rate limiting** on `POST /api/predictions`. The unique index bounds the
-  damage (a player cannot accumulate predictions), but request volume is
-  unbounded.
+  damage (a player cannot accumulate predictions) and request bodies are capped
+  at 1 KB ([D22](DECISIONS.md)), but request *volume* is unbounded — a per-IP or
+  per-player limiter is the next step.
 - **Single venue price.** One exchange, not a cross-venue index.
 - **Score integrity is not enforced across tables.** `players.score` is derived
   from resolved predictions, but no constraint verifies the sum (a `CHECK`

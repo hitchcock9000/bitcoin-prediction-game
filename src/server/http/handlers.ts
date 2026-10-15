@@ -39,6 +39,15 @@ import {
  *    bodies — without booting a server or depending on framework internals.
  */
 
+/**
+ * The prediction request body is `{"direction":"up"}` — about 20 bytes. A
+ * generous ceiling keeps a large upload from being buffered and parsed into
+ * memory before any rule gets a look at it.
+ *
+ * Found by review rather than by design: a 2 MB body was accepted with 201.
+ */
+const MAX_PREDICTION_BODY_BYTES = 1024;
+
 export interface HandlerDeps {
   store: GameStore;
   service: GameService;
@@ -188,9 +197,40 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     async handleCreatePrediction(request: Request): Promise<Response> {
       const currentTime = now();
 
+      // Two guards against an oversized body, because a single one is not
+      // enough: a chunked upload can omit Content-Length entirely.
+      //
+      // 1. Declared length, checked *before* reading, so an honest client's
+      //    2 MB upload is refused without being buffered.
+      const declaredLength = request.headers.get('content-length');
+      if (declaredLength !== null) {
+        const bytes = Number(declaredLength);
+        if (!Number.isFinite(bytes) || bytes < 0) {
+          return errorResponse(400, 'invalid_request', 'Malformed Content-Length header.');
+        }
+        if (bytes > MAX_PREDICTION_BODY_BYTES) {
+          return errorResponse(413, 'payload_too_large', 'Request body is too large.');
+        }
+      }
+
+      // 2. Actual length, so a body without a declared length is still bounded.
+      //    Honest caveat: this one runs after the body has been read, so it
+      //    bounds what gets *parsed and processed* rather than what gets
+      //    buffered. A hard memory bound for chunked uploads belongs at the
+      //    platform proxy, which is where a real deployment enforces it.
+      let rawBody: string;
+      try {
+        rawBody = await request.text();
+      } catch {
+        return errorResponse(400, 'invalid_request', 'Could not read the request body.');
+      }
+      if (rawBody.length > MAX_PREDICTION_BODY_BYTES) {
+        return errorResponse(413, 'payload_too_large', 'Request body is too large.');
+      }
+
       let body: unknown;
       try {
-        body = await request.json();
+        body = JSON.parse(rawBody);
       } catch {
         return errorResponse(400, 'invalid_request', 'Expected a JSON body with a "direction" field.');
       }

@@ -185,6 +185,40 @@ describe('HTTP API', () => {
       }
     });
 
+    it('rejects an oversized body', async () => {
+      // A prediction is ~20 bytes of JSON. A 2 MB body was previously accepted
+      // and buffered; the review caught it.
+      const { handlers } = makeHandlers();
+      const response = await handlers.handleCreatePrediction(
+        predictionRequest({ direction: 'up', padding: 'x'.repeat(2_000_000) }),
+      );
+
+      expect(response.status).toBe(413);
+      expect(((await response.json()) as ApiErrorBody).error.code).toBe('payload_too_large');
+    });
+
+    it('rejects an oversized body from the declared Content-Length, before reading it', async () => {
+      // The fast path a real HTTP client hits: the header is present, so the
+      // body is refused without being buffered.
+      const { handlers } = makeHandlers();
+      const response = await handlers.handleCreatePrediction(
+        new Request('http://test.local/api/predictions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': '2000000' },
+          body: JSON.stringify({ direction: 'up' }),
+        }),
+      );
+      expect(response.status).toBe(413);
+    });
+
+    it('still accepts a body that is large for a reason but within the limit', async () => {
+      const { handlers } = makeHandlers();
+      const response = await handlers.handleCreatePrediction(
+        predictionRequest({ direction: 'up', comment: 'x'.repeat(200) }),
+      );
+      expect(response.status).toBe(201);
+    });
+
     it('rejects a malformed JSON body with 400', async () => {
       const { handlers } = makeHandlers();
       const response = await handlers.handleCreatePrediction(
