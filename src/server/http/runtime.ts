@@ -43,7 +43,3 @@ export function getHandlers(): Handlers {
   return globalForHandlers.__bpgHandlers;
 }
 
-/** Test helper. */
-export function resetHandlersForTests(): void {
-  globalForHandlers.__bpgHandlers = undefined;
-}

@@ -109,7 +109,3 @@ export function getConfig(): AppConfig {
   return cached;
 }
 
-/** Test helper: drop the cached config so an env change takes effect. */
-export function resetConfigCache(): void {
-  cached = undefined;
-}

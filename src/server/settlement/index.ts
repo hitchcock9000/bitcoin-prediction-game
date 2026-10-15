@@ -73,8 +73,3 @@ export function isSchedulerRunning(): boolean {
   return getScheduler()?.isRunning() ?? false;
 }
 
-/** Test/teardown helper. */
-export function stopSettlement(): void {
-  globalForSettlement.__bpgScheduler?.stop();
-  globalForSettlement.__bpgScheduler = null;
-}

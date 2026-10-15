@@ -28,10 +28,3 @@ export function getPool(): Pool {
   return globalForPool.__bpgPool;
 }
 
-export async function closePool(): Promise<void> {
-  const pool = globalForPool.__bpgPool;
-  if (pool) {
-    globalForPool.__bpgPool = undefined;
-    await pool.end();
-  }
-}
