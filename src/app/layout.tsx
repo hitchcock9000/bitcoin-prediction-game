@@ -2,15 +2,15 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'BTC — one minute prediction',
+  title: 'BTC / USD — Up or down?',
   description:
-    'Predict whether the BTC/USD price will be higher or lower one minute from now. Server-authoritative settlement.',
+    'Predict whether BTC/USD will move higher or lower after at least 60 seconds. Server-authoritative settlement.',
 };
 
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
-  themeColor: '#0b0f16',
+  themeColor: '#0a0a09',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
