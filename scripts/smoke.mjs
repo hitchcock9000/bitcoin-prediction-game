@@ -129,8 +129,10 @@ async function main() {
     `explanation="${immediate.body?.activePrediction?.explanation}"`,
   );
 
-  // 6. Wait for the server to settle it, without touching the page.
-  console.log(`\nWaiting up to ${maxWaitSeconds}s for the server to settle (no requests needed)...`);
+  // 6. Poll state until the server reports the prediction as settled. On a
+  // serverless deployment, these state requests may themselves trigger the
+  // bounded settlement sweep.
+  console.log(`\nPolling for up to ${maxWaitSeconds}s until the server reports settlement...`);
   const startedAt = Date.now();
   let settled = null;
   while ((Date.now() - startedAt) / 1000 < maxWaitSeconds) {
@@ -145,7 +147,7 @@ async function main() {
   }
 
   if (!settled) {
-    record('the prediction settles without the browser', false, `still pending after ${maxWaitSeconds}s`);
+    record('the prediction settles while state is polled', false, `still pending after ${maxWaitSeconds}s`);
     finish();
     return;
   }
@@ -168,9 +170,12 @@ async function main() {
     expectedOutcome !== null && result?.outcome === expectedOutcome,
     `entry=${entryPrice} settlement=${result?.settlementPrice} outcome=${result?.outcome}`,
   );
+  const expectedDelta = expectedOutcome === 'win' ? 1 : expectedOutcome === 'loss' ? -1 : null;
   record(
     'the score moved by exactly one point',
-    settled.player?.score === 1 && result?.scoreDelta === 1,
+    expectedOutcome !== null &&
+      settled.player?.score === expectedDelta &&
+      result?.scoreDelta === expectedDelta,
     `score=${settled.player?.score} delta=${result?.scoreDelta}`,
   );
   console.log(`\nSettled ${elapsed}s after the sweep started (the wait itself is server-side).`);
