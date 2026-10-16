@@ -165,6 +165,9 @@ identity cookies, HTTP responses, database constraints, score persistence and
 concurrent settlement. `scripts/smoke.mjs` provides an additional full HTTP
 journey for the local/container mode.
 
+Pull requests to `main` run the same typecheck, lint, test and build checks in
+GitHub Actions against an isolated PostgreSQL 17 service.
+
 ## 6. Deployment
 
 The public deployment is:
