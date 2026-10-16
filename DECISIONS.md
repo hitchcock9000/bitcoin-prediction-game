@@ -39,8 +39,11 @@ A real production UP prediction (`8fb83f27…`) entered at $81,935.05 at
 from quote time `10:18:55.930Z` (UTC). Score moved to −1 once and remained
 stable across repeated reads. Local typecheck, lint, production build, and all
 170 tests passed; production dependency audit reported zero vulnerabilities.
-These results verify the request-triggered deployment. Actual cron-job.org
-setup/execution and a closed-browser production round remain unverified.
+These results verify the request-triggered deployment. The external path was
+then verified with production prediction `03177572…`: no `/api/state` request
+occurred after creation at `10:42:24.692Z`; cron-job.org sent
+`POST /api/settle` at `10:45:16.680Z` and received 200; PostgreSQL resolved the
+row at `10:45:17.129Z` using a Coinbase quote timestamped `10:45:16.226Z`.
 
 A running log, written as decisions were made. Each entry records the context,
 the choice, the alternative that was rejected, and the honest trade-off. Where a

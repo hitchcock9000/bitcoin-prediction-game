@@ -6,7 +6,8 @@
 > fallback when no browser is open. The in-process scheduler is disabled on
 > Vercel. Deployed on 16 October 2026:
 > **https://bitcoin-prediction-game-khaki.vercel.app**.
-> The external cron still requires setup and execution verification.
+> The external cron is configured and its browser-independent execution was
+> verified against a real production prediction.
 >
 > A delayed sweep uses a later eligible market quote, so delay can affect the
 > outcome, not just when the result appears. The original domain policy and
@@ -31,9 +32,9 @@ show next.
 
 > **Status.** The complete game — schema, settlement engine, HTTP API and UI — is
 > implemented and verified locally, including the full loop end to end. The
-> public application is deployed and a real Coinbase round is verified. External
-> cron execution remains unverified. See [Current status](#current-status) for
-> the distinction between local checks and production evidence.
+> public application is deployed, and both request-triggered and scheduled
+> Coinbase rounds are verified. See [Current status](#current-status) for the
+> distinction between local checks and production evidence.
 
 ---
 
@@ -77,8 +78,8 @@ show next.
 | Public deployment | Verified at https://bitcoin-prediction-game-khaki.vercel.app on 16 October 2026 |
 | Production database | Neon migrations applied; health reports database up |
 | Production price provider | Coinbase; `simulated: false` |
-| Production settlement triggers | Request-triggered sweep verified; in-process scheduler disabled; external secret configured |
-| External cron execution | Pending cron-job.org setup and execution verification |
+| Production settlement triggers | Request-triggered and cron sweeps verified; in-process scheduler disabled |
+| External cron execution | Verified: cron-job.org POST returned 200 and settled an idle production prediction |
 | Repository | Public: https://github.com/hitchcock9000/bitcoin-prediction-game |
 
 Production round evidence (16 October 2026, UTC): prediction `8fb83f27…`
@@ -86,8 +87,15 @@ was UP at $81,935.05, created at `10:17:46.723Z`. It resolved as a loss at
 `10:18:57.812Z`, using $81,905.00 from source timestamp `10:18:55.930Z`.
 The score became −1 and stayed stable across repeated state reads. Health
 reported `schedulerEnabled=false`, `schedulerRunning=false`,
-`requestTriggered=true`, and `externalTriggerConfigured=true`. A configured
-secret does not prove an external job executed; that verification is outstanding.
+`requestTriggered=true`, and `externalTriggerConfigured=true`.
+
+Background-settlement evidence (16 October 2026, UTC): after prediction
+`03177572…` was created at `10:42:24.692Z`, no `/api/state` request was made.
+The row remained pending after eligibility. cron-job.org then sent
+`POST /api/settle` at `10:45:16.680Z` and received HTTP 200. PostgreSQL resolved
+the prediction at `10:45:17.129Z`, using a Coinbase quote timestamped
+`10:45:16.226Z`. This verifies the browser-independent fallback without claiming
+that the settlement price represents the market at exactly 60 seconds.
 
 ---
 
@@ -104,8 +112,8 @@ secret does not prove an external job executed; that verification is outstanding
 6. A win adds one point, a loss subtracts one point.
 
 On Vercel, state requests await a server settlement sweep. A 15-minute external
-cron is the planned fallback when no browser is open; its execution is not yet
-verified. Pending records survive restarts in PostgreSQL. The alternative
+cron is the verified fallback when no browser is open. Pending records survive
+restarts in PostgreSQL. The alternative
 long-running container deployment also supports an in-process timer.
 
 ### HTTP API
@@ -191,9 +199,9 @@ client clock cannot change a result.
 - [x] Settlement cannot update the score twice (repeated and concurrent settlement tested)
 - [x] UI states implemented and served from the production build
 - [x] Full game loop verified over HTTP (`scripts/smoke.mjs`, 14/14)
-- [x] Scheduler verified in the production process, and restart recovery demonstrated
+- [x] Container scheduler alternative and restart recovery verified locally
 - [x] Publicly accessible deployment verified on 16 October 2026
-- [ ] External cron execution and closed-browser production settlement verified
+- [x] External cron execution without state traffic verified
 - [x] Repository is public
 - [x] README, DECISIONS.md and WALKTHROUGH.md reflect the implementation
 - [x] Critical tests run and reported
@@ -212,7 +220,7 @@ these change the stated rules; they fill gaps the rules leave open.
 | A1 | What if the price is unchanged after 60 seconds? | Stay pending until a later quote actually moves. Never scored as a win or a loss. | A prediction can stay open indefinitely on a flat market. This follows the rules literally ("the price has changed" is a condition of resolution, and unchanged must not be treated as win or loss); the cost is that the player waits. |
 | A2 | Which quote counts as the settlement price? | The freshest quote the provider returns at the first sweep *at or after* 60 seconds, provided it is strictly newer than the entry quote and is not stale (≤30s old). | State polling normally triggers settlement soon after eligibility. Idle settlement depends on the 15-minute external cron; delays can change the outcome because a later price is used. |
 | A3 | What happens if the price provider is unavailable? | No outcome is produced. Entry is refused (no prediction created); settlement stays pending and retries. | Players cannot start a round during an outage. Preferred over reusing a stale price, which would silently settle against the wrong market. |
-| A4 | What happens if the user closes the browser? | State persists. An external cron can run the sweep without a browser. | On the chosen host this requires the configured 15-minute job; actual execution remains unverified. |
+| A4 | What happens if the user closes the browser? | State persists. An external cron runs the sweep without browser traffic. | Verified in production with a due row, a cron POST 200, and no intervening `/api/state` request. |
 | A5 | Two requests create a prediction at the same instant? | The partial unique index lets exactly one succeed; the other gets `409`. | Requires no client cooperation; verified with 20 concurrent inserts. |
 | A6 | Settlement attempted twice, concurrently? | The conditional `UPDATE ... WHERE status = 'pending'` makes the second a no-op. The score moves once. | Verified with 10 concurrent settlements and two racing sweeps. |
 | A7 | How is an anonymous player identified? | A random UUID minted by the server, returned in an HMAC-signed `HttpOnly` cookie. The client never supplies an id. | Clearing cookies loses the score. This is integrity, not authentication — see [D9](DECISIONS.md). |
@@ -277,7 +285,7 @@ flowchart TB
   end
 
   COINBASE["Coinbase Exchange<br/>/products/BTC-USD/ticker"]
-  CRON["cron-job.org POST /api/settle<br/>every 15 min; execution unverified"]
+  CRON["cron-job.org POST /api/settle<br/>every 15 min; verified"]
 
   UI -->|"HTTP (cookie only, never an id)"| API
   API --> IDENT
@@ -694,8 +702,8 @@ dashboard shows.
 Honest list; the reasoning is in [DECISIONS.md](DECISIONS.md).
 
 - **Idle settlement needs the external cron.** State requests drive active play;
-  the planned 15-minute job provides the background fallback. Execution is still
-  unverified. Idle resolution may occur roughly 15 minutes later or longer during
+  the verified 15-minute job provides the background fallback. Idle resolution
+  may occur roughly 15 minutes later or longer during
   outages or unchanged prices. Later quotes can change the outcome; this is not
   an exact-price-at-second-60 game.
 - **Concurrent triggers are safe but consume resources.** Atomic settlement

@@ -20,7 +20,12 @@ This is a documented zero-cost trade-off, not a claim to settle at exactly
 https://bitcoin-prediction-game-khaki.vercel.app (16 October 2026), with Neon
 migrations applied and Coinbase reporting `simulated:false`. Health confirms
 the scheduler is off, request-triggered settlement is on, and an external
-secret is configured. Actual cron-job.org execution remains unverified.
+secret is configured. cron-job.org execution is verified below.
+
+That cron execution was subsequently verified with production prediction
+`03177572…`: after creation at `10:42:24.692Z`, no state request occurred. The
+cron POST returned 200 at `10:45:16.680Z`, and PostgreSQL resolved the row at
+`10:45:17.129Z` using the Coinbase quote from `10:45:16.226Z` (UTC).
 
 The verified production UP round `8fb83f27…` entered at $81,935.05 at
 `10:17:46.723Z`, then lost at $81,905.00, resolved at `10:18:57.812Z` using
@@ -61,8 +66,8 @@ Suggested shape for a 20-minute session:
 >
 > Concretely that's 170 tests and a schema that enforces the rules as constraints.
 > On Vercel, state requests trigger the settlement sweep. A 15-minute external
-> cron is the planned fallback when the tab is closed; its execution still needs
-> verification. Delayed settlement uses a later price and can change the result."
+> cron is the verified fallback when the tab is closed. Delayed settlement uses
+> a later price and can change the result."
 
 ---
 
@@ -315,7 +320,7 @@ once, and the same cookie could play again. Nothing lives in process memory.
 ### Limitations I'd volunteer before being asked
 
 1. **Idle settlement delay.** With no requests, the external 15-minute cron must
-   drive settlement. It still needs execution verification. A later quote can
+   drive settlement. That path is verified in production. A later quote can
    change the outcome, even though minimum-wait and scoring invariants hold.
 2. **Identity is integrity, not authentication.** The signature stops you
    impersonating a specific player; it doesn't stop you clearing your cookie and
@@ -389,9 +394,9 @@ in `decideSettlement`, and it's covered by tests at both levels.
 **What if the browser closes?**
 The prediction persists in PostgreSQL. On the chosen Vercel deployment, the
 15-minute external cron must run the sweep when there are no state requests.
-That execution is still unverified; configuring its secret is not proof. The
-earlier local/container restart test demonstrated boot recovery, but does not
-verify hosted background processing. Delayed quotes can produce a different result.
+That path was verified with a production row, a POST 200 in Vercel logs, and no
+intervening state request. The earlier local/container restart test separately
+demonstrated boot recovery. Delayed quotes can produce a different result.
 
 **What prevents duplicate predictions?**
 A partial unique index, not an application check. The service *also* checks, but
