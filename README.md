@@ -148,10 +148,11 @@ npm run build
 ```
 
 The deployed version was verified on 16 October 2026 with 170 passing tests.
-The later engineering-review branch produced 174 passing tests across the same
-10 files, plus typecheck, lint and a production build. Its added coverage checks
-malformed cookies, identity retention after a provider failure, and overlapping
-sweeps within and across server instances.
+The engineering-review branch produced 176 passing tests across the same 10
+files, plus typecheck, lint and a production build. Its added coverage checks
+malformed cookies, identity retention after a provider failure, overlapping
+sweeps within and across server instances, concurrent prediction conflicts and
+the PostgreSQL snapshot edge case during concurrent player creation.
 
 The deployment verification also included:
 

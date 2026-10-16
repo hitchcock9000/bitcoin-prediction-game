@@ -226,7 +226,8 @@ boundaries without waiting in real time.
 
 This is the only module containing game SQL.
 
-- `ensurePlayer` inserts once and otherwise returns the existing player;
+- `ensurePlayer` normally inserts or reads in one statement; a rare concurrent
+  insert conflict uses a second read so PostgreSQL gives it a fresh snapshot;
 - `getActivePrediction` and `getLatestPrediction` build the state view;
 - `createPrediction` relies on the partial unique index and maps its specific
   violation to `ActivePredictionExistsError`;

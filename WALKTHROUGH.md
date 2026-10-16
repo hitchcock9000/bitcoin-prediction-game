@@ -186,8 +186,9 @@ npm run build
 ```
 
 The deployed-version pass on 16 October 2026 had 170 passing tests across 10
-files. The engineering-review branch later had 174 passing tests across the
-same 10 files.
+files. The engineering-review branch later had 176 passing tests across the
+same 10 files, including deterministic regressions for concurrent prediction
+submission and concurrent first-player creation.
 
 - Unit tests cover the settlement matrix, time boundaries, bad quotes, decimal
   comparison, identity and Coinbase parsing.

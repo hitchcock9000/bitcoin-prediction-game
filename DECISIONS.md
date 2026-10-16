@@ -329,6 +329,31 @@ an immediate refresh. This does not solve large-scale rate limiting, but it
 removes obvious background traffic without changing the API or the active game
 experience.
 
+## D27 — Recover explicitly from concurrent insert conflicts
+
+Review follow-up: 16 October 2026.
+
+The partial unique index already prevented two pending predictions, but the
+losing request surfaced the store's `ActivePredictionExistsError` as HTTP 500.
+The service now reloads the winning row and translates that known conflict to
+the existing `PredictionAlreadyActiveError`, so the HTTP layer returns 409 with
+authoritative state. A barrier-controlled HTTP test forces both requests past
+the pre-check before either insert runs.
+
+Player creation had a subtler PostgreSQL edge case. The single-statement
+`INSERT ... ON CONFLICT DO NOTHING` CTE can observe another transaction's
+conflict while its original statement snapshot still cannot see the row that
+caused it. If the CTE returns no row, `ensurePlayer` now performs one separate
+`SELECT`, which gets a fresh Read Committed snapshot. I rejected `ON CONFLICT DO
+UPDATE ... RETURNING`: it would return the row in one statement, but would also
+turn every polling read for an existing player into an unnecessary write.
+
+The regression test holds the first insert open, confirms through
+`pg_blocking_pids` that the second connection is waiting for it, commits the
+first transaction and verifies that the fallback returns the player. This
+covers the actual transaction ordering rather than hoping concurrent promises
+happen to reproduce it.
+
 ## Open questions
 
 These need product or scale evidence before code changes:

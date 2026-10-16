@@ -310,7 +310,7 @@ Neon child branch named `review-engineering-improvements-test` was created from
 environment. The branch expires automatically on 18 October 2026. Production
 credentials, data and environment files were not changed.
 
-Final verification:
+Initial review verification:
 
 ```text
 npm run typecheck  PASS
@@ -319,6 +319,13 @@ npm test           PASS, 174 tests across 10 files
 npm run build      PASS, Next.js 15.5.28 production build
 git diff --check   PASS
 ```
+
+The three confirmed follow-up defects were then corrected on the review branch:
+the concurrent unique-index loser now maps to HTTP 409, `ensurePlayer` retries
+its read with a fresh statement snapshot, and the smoke test accepts both valid
+score directions. The two deterministic regression tests brought the suite to
+176 passing tests across the same 10 files. Typecheck, lint and the production
+build passed again after those changes.
 
 The test run emitted the `pg` package's forward-looking warning about upcoming
 `sslmode=require` semantics. It did not fail the run. No deployment, production
