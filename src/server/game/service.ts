@@ -112,14 +112,23 @@ export function createGameService(deps: GameServiceDeps) {
       // 5. Persist. `created_at` is the database's clock, and the entry quote's
       //    own timestamp is stored alongside the price so the 60-second window
       //    can be audited later.
-      const prediction = await deps.store.createPrediction({
-        playerId: input.playerId,
-        direction: input.direction,
-        entryPrice: quote.price,
-        entryPriceAt: quote.at,
-        entryTradeId: quote.tradeId,
-        priceSource: quote.source,
-      });
+      let prediction: PredictionRecord;
+      try {
+        prediction = await deps.store.createPrediction({
+          playerId: input.playerId,
+          direction: input.direction,
+          entryPrice: quote.price,
+          entryPriceAt: quote.at,
+          entryTradeId: quote.tradeId,
+          priceSource: quote.source,
+        });
+      } catch (error) {
+        if (error instanceof ActivePredictionExistsError) {
+          const activePrediction = await deps.store.getActivePrediction(input.playerId);
+          if (activePrediction) throw new PredictionAlreadyActiveError(activePrediction);
+        }
+        throw error;
+      }
 
       return { state: await this.getPlayerState(input.playerId), prediction };
     },

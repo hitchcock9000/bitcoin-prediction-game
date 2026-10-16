@@ -15,7 +15,7 @@ import {
   resetDatabase,
   testPool,
 } from '../helpers/db';
-import { failingProvider, fixedPrice, StubPriceProvider } from '../helpers/stubPriceProvider';
+import { failingProvider, fixedPrice, quoteAt, StubPriceProvider } from '../helpers/stubPriceProvider';
 
 /**
  * HTTP-level tests.
@@ -259,6 +259,43 @@ describe('HTTP API', () => {
       expect(body.error.code).toBe('prediction_already_active');
       // The state comes back so the UI can resynchronise without another round trip.
       expect(body.state.activePrediction?.direction).toBe('up');
+
+      const { rows } = await testPool().query(
+        `select count(*)::int as n from predictions where status = 'pending'`,
+      );
+      expect(rows[0].n).toBe(1);
+    });
+
+    it('returns 409 when concurrent submissions reach the unique index together', async () => {
+      let entryCalls = 0;
+      let releaseEntries!: () => void;
+      const bothEntriesReady = new Promise<void>((resolve) => {
+        releaseEntries = resolve;
+      });
+      const provider = new StubPriceProvider(async () => {
+        entryCalls += 1;
+        if (entryCalls <= 2) {
+          if (entryCalls === 2) releaseEntries();
+          await bothEntriesReady;
+        }
+        return quoteAt('82000.00', new Date(), 2_000_000 + entryCalls);
+      });
+      const { handlers, store } = makeHandlers({ provider });
+      const playerId = newPlayerId();
+      await store.ensurePlayer(playerId);
+      const cookie = `bpg_player=${signFor(playerId)}`;
+
+      const responses = await Promise.all([
+        handlers.handleCreatePrediction(predictionRequest({ direction: 'up' }, cookie)),
+        handlers.handleCreatePrediction(predictionRequest({ direction: 'down' }, cookie)),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+      const conflict = responses.find((response) => response.status === 409);
+      expect(conflict).toBeDefined();
+      const body = (await conflict!.json()) as ConflictBody;
+      expect(body.error.code).toBe('prediction_already_active');
+      expect(body.state.activePrediction).not.toBeNull();
 
       const { rows } = await testPool().query(
         `select count(*)::int as n from predictions where status = 'pending'`,
