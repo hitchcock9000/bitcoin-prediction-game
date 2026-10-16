@@ -22,4 +22,9 @@ next-env.d.ts
 test-results/
 .vercel
 .env*
+
+# Personal project notes and local agent instructions
+/AGENTS.md
+/STUDY_GUIDE.md
+/WALKTHROUGH.md
 .neon

@@ -16,8 +16,7 @@ timestamps, result and score changes.
 The deployed app uses real BTC/USD quotes from Coinbase Exchange. It runs on
 Vercel Hobby with Neon Postgres and a cron-job.org fallback, all on free tiers.
 
-For the longer reasoning trail, see [DECISIONS.md](DECISIONS.md). For a guided
-tour of the implementation, see [WALKTHROUGH.md](WALKTHROUGH.md).
+For the longer reasoning trail, see [DECISIONS.md](DECISIONS.md).
 
 ## 2. How the game works
 
@@ -148,8 +147,8 @@ npm run build
 ```
 
 The deployed version was verified on 16 October 2026 with 170 passing tests.
-The engineering-review branch produced 176 passing tests across the same 10
-files, plus typecheck, lint and a production build. Its added coverage checks
+The final verification pass produced 176 passing tests across the same 10
+files, plus typecheck, lint and a production build. The added coverage checks
 malformed cookies, identity retention after a provider failure, overlapping
 sweeps within and across server instances, concurrent prediction conflicts and
 the PostgreSQL snapshot edge case during concurrent player creation.
