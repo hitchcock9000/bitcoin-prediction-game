@@ -4,7 +4,9 @@
 > Neon Free + cron-job.org Free, with no paid add-ons. The server now awaits a
 > bounded settlement sweep on state requests; the 15-minute external cron is a
 > fallback when no browser is open. The in-process scheduler is disabled on
-> Vercel. Deployment is not yet verified; no public URL is claimed.
+> Vercel. Deployed on 16 October 2026:
+> **https://bitcoin-prediction-game-khaki.vercel.app**.
+> The external cron still requires setup and execution verification.
 >
 > A delayed sweep uses a later eligible market quote, so delay can affect the
 > outcome, not just when the result appears. The original domain policy and
@@ -29,9 +31,9 @@ show next.
 
 > **Status.** The complete game — schema, settlement engine, HTTP API and UI — is
 > implemented and verified locally, including the full loop end to end. The
-> public deployment and the repository publication are the remaining steps. See
-> [Current status](#current-status). Nothing in this README describes behaviour
-> that has not been run.
+> public application is deployed and a real Coinbase round is verified. External
+> cron execution remains unverified. See [Current status](#current-status) for
+> the distinction between local checks and production evidence.
 
 ---
 
@@ -70,10 +72,22 @@ show next.
 | Player identity (signed cookie) | Implemented, tested |
 | HTTP API (`state`, `predictions`, `settle`, `health`) | Implemented, tested at HTTP level |
 | UI (all eight states) | Implemented, served from the production build |
-| Scheduler in the production process | Verified in `node .next/standalone/server.js` |
-| Full game loop over HTTP | Verified end to end (`scripts/smoke.mjs`, 14/14 checks) |
-| Public deployment | Not yet done — no URL is claimed |
-| Repository published | Not yet done — branch pushed, PR open |
+| Container scheduler (alternative deployment) | Verified locally in `node .next/standalone/server.js` |
+| Simulated full game loop over HTTP | Verified locally (`scripts/smoke.mjs`, 14/14 checks) |
+| Public deployment | Verified at https://bitcoin-prediction-game-khaki.vercel.app on 16 October 2026 |
+| Production database | Neon migrations applied; health reports database up |
+| Production price provider | Coinbase; `simulated: false` |
+| Production settlement triggers | Request-triggered sweep verified; in-process scheduler disabled; external secret configured |
+| External cron execution | Pending cron-job.org setup and execution verification |
+| Repository | Public: https://github.com/hitchcock9000/bitcoin-prediction-game |
+
+Production round evidence (16 October 2026, UTC): prediction `8fb83f27…`
+was UP at $81,935.05, created at `10:17:46.723Z`. It resolved as a loss at
+`10:18:57.812Z`, using $81,905.00 from source timestamp `10:18:55.930Z`.
+The score became −1 and stayed stable across repeated state reads. Health
+reported `schedulerEnabled=false`, `schedulerRunning=false`,
+`requestTriggered=true`, and `externalTriggerConfigured=true`. A configured
+secret does not prove an external job executed; that verification is outstanding.
 
 ---
 
@@ -89,8 +103,10 @@ show next.
    a win for UP and a loss for DOWN, and vice versa.
 6. A win adds one point, a loss subtracts one point.
 
-Settlement is driven by the server on a timer. It does not depend on the browser
-remaining open, and it survives restarts.
+On Vercel, state requests await a server settlement sweep. A 15-minute external
+cron is the planned fallback when no browser is open; its execution is not yet
+verified. Pending records survive restarts in PostgreSQL. The alternative
+long-running container deployment also supports an in-process timer.
 
 ### HTTP API
 
@@ -156,9 +172,9 @@ client clock cannot change a result.
 | --- | --- |
 | Returning anonymous players keep their score | Implemented (signed 1-year cookie + persisted rows), tested |
 | An open prediction survives a refresh or a restart | Implemented (the client is stateless; state comes from `/api/state`) |
-| A countdown for the minimum wait | Planned (UI) |
-| Clear loading, pending, won, lost and error states | Planned (UI) |
-| Responsive, accessible UI | Planned (UI) |
+| A countdown for the minimum wait | Implemented; presentational only |
+| Clear loading, pending, won, lost and error states | Implemented |
+| Responsive, accessible UI | Implemented; browser interaction verification limitations below |
 | Additional monitoring | Partially: structured settlement logs + `/api/health` |
 
 ### Definition of done, as a checklist
@@ -176,7 +192,8 @@ client clock cannot change a result.
 - [x] UI states implemented and served from the production build
 - [x] Full game loop verified over HTTP (`scripts/smoke.mjs`, 14/14)
 - [x] Scheduler verified in the production process, and restart recovery demonstrated
-- [ ] Publicly accessible deployment ← *pending, needs deployment credentials*
+- [x] Publicly accessible deployment verified on 16 October 2026
+- [ ] External cron execution and closed-browser production settlement verified
 - [x] Repository is public
 - [x] README, DECISIONS.md and WALKTHROUGH.md reflect the implementation
 - [x] Critical tests run and reported
@@ -193,9 +210,9 @@ these change the stated rules; they fill gaps the rules leave open.
 | # | Ambiguity | Interpretation | Impact / trade-off |
 | --- | --- | --- | --- |
 | A1 | What if the price is unchanged after 60 seconds? | Stay pending until a later quote actually moves. Never scored as a win or a loss. | A prediction can stay open indefinitely on a flat market. This follows the rules literally ("the price has changed" is a condition of resolution, and unchanged must not be treated as win or loss); the cost is that the player waits. |
-| A2 | Which quote counts as the settlement price? | The freshest quote the provider returns at the first sweep *at or after* 60 seconds, provided it is strictly newer than the entry quote and is not stale (≤30s old). | Settlement happens on the first sweep where a qualifying quote exists, so resolution is within one tick (≈5s) of eligibility. |
+| A2 | Which quote counts as the settlement price? | The freshest quote the provider returns at the first sweep *at or after* 60 seconds, provided it is strictly newer than the entry quote and is not stale (≤30s old). | State polling normally triggers settlement soon after eligibility. Idle settlement depends on the 15-minute external cron; delays can change the outcome because a later price is used. |
 | A3 | What happens if the price provider is unavailable? | No outcome is produced. Entry is refused (no prediction created); settlement stays pending and retries. | Players cannot start a round during an outage. Preferred over reusing a stale price, which would silently settle against the wrong market. |
-| A4 | What happens if the user closes the browser? | Nothing. State lives in the database; the sweep resolves the prediction with no client involvement. | None — this is the intended behaviour. |
+| A4 | What happens if the user closes the browser? | State persists. An external cron can run the sweep without a browser. | On the chosen host this requires the configured 15-minute job; actual execution remains unverified. |
 | A5 | Two requests create a prediction at the same instant? | The partial unique index lets exactly one succeed; the other gets `409`. | Requires no client cooperation; verified with 20 concurrent inserts. |
 | A6 | Settlement attempted twice, concurrently? | The conditional `UPDATE ... WHERE status = 'pending'` makes the second a no-op. The score moves once. | Verified with 10 concurrent settlements and two racing sweeps. |
 | A7 | How is an anonymous player identified? | A random UUID minted by the server, returned in an HMAC-signed `HttpOnly` cookie. The client never supplies an id. | Clearing cookies loses the score. This is integrity, not authentication — see [D9](DECISIONS.md). |
@@ -218,15 +235,15 @@ these change the stated rules; they fill gaps the rules leave open.
 | DB access | `pg` with hand-written SQL | The important query is a data-modifying CTE an ORM would obscure — see [D13](DECISIONS.md) |
 | Market data | Coinbase Exchange public API | Real BTC/USD with a provider timestamp and trade id — see [D2](DECISIONS.md) |
 | Tests | Vitest, against a real PostgreSQL | The guarantees are database behaviour — see [D15](DECISIONS.md) |
-| Hosting | Long-running container (Railway / Render) | The settlement scheduler needs a process that stays alive — see [D3](DECISIONS.md) |
+| Hosting | Vercel Hobby + Neon Free + cron-job.org Free | Request-triggered settlement with a 15-minute idle fallback; finite free quotas — see D23 in [DECISIONS.md](DECISIONS.md) |
 | Client bundle | 105 kB first load | No UI framework, no chart library |
 
 ### Why not AWS
 
 AWS is listed as preferred, not required, and the honest answer is that nothing
-here needs AWS to be correct. The requirements land on a relational database, a
-long-lived HTTP process and an outbound call to a market data API — all of which a
-container host with managed Postgres provides in two commands. Reaching for App
+here needs AWS to be correct. The selected deployment uses Vercel, Neon and an
+external scheduler within free quotas. A container with managed PostgreSQL is
+an alternative. Reaching for App
 Runner + RDS + an EventBridge schedule would add IAM roles, a VPC, a container
 registry and a scheduled trigger, and would consume most of a half-day exercise
 without making any game rule more reliable.
@@ -246,11 +263,11 @@ flowchart TB
     UI["React UI<br/>price · score · UP/DOWN<br/>countdown is presentational"]
   end
 
-  subgraph server["Next.js server process (long-running container)"]
+  subgraph server["Next.js server functions (Vercel)"]
     API["Route handlers<br/>/api/state · /api/predictions · /api/settle"]
     SVC["Game service<br/>ownership boundary:<br/>who may do what"]
     RULES["Domain rules (pure)<br/>decideSettlement · compareDecimal"]
-    SCHED["Settlement scheduler<br/>setInterval ≈5s"]
+    SCHED["State-request trigger"]
     SWEEP["Sweep runner<br/>one quote per sweep"]
     IDENT["Identity<br/>HMAC-signed cookie"]
   end
@@ -260,10 +277,13 @@ flowchart TB
   end
 
   COINBASE["Coinbase Exchange<br/>/products/BTC-USD/ticker"]
+  CRON["cron-job.org POST /api/settle<br/>every 15 min; execution unverified"]
 
   UI -->|"HTTP (cookie only, never an id)"| API
   API --> IDENT
   API --> SVC
+  API --> SCHED
+  CRON --> API
   SVC --> RULES
   SVC -->|"entry price"| COINBASE
   SVC --> DB
@@ -289,8 +309,9 @@ flowchart TB
 - **Domain rules.** Pure functions with no database, no clock and no network.
   `decideSettlement` takes an entry price, a candidate quote and a `now`, and
   returns either a concrete outcome or a named reason to stay pending.
-- **Settlement scheduler.** A `setInterval` in the server process that calls the
-  sweep. Stateless, and it also runs once on boot, so restarts recover.
+- **Settlement triggers.** State requests await the sweep; external cron invokes
+  the same sweep through the protected endpoint. Vercel disables interval
+  scheduling. A timer and boot sweep remain available for local/container use.
 - **Database.** Holds the state of record *and* enforces invariants
   independently of the application (one pending prediction per player, no early
   resolution, outcome must match price movement).
@@ -302,11 +323,11 @@ Data flow for one round:
 1. `POST /api/predictions` → identity verified → service asks the provider for a
    quote → quote freshness checked → row inserted (or `409` if one is already
    open) → authoritative state returned.
-2. The scheduler ticks → the sweep asks the database which pending predictions
+2. A state request or authenticated cron call triggers the sweep → it asks which predictions
    are due (database clock) → one quote is fetched for the whole batch → each
    candidate is decided → settled rows are updated and the score moves in the
    same statement.
-3. The UI polls `/api/state` and renders whatever the server says.
+3. The UI polls `/api/state`, which awaits settlement, and renders whatever the server says.
 
 ---
 
@@ -437,6 +458,9 @@ docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=bpg_de
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | yes | — | PostgreSQL connection string |
+| `DATABASE_MIGRATION_URL` | no | `DATABASE_URL` | Direct Neon connection for migration CLI |
+| `DATABASE_URL_UNPOOLED` | no | `DATABASE_URL` | Direct URL emitted by `neon deploy`; second migration preference |
+| `DATABASE_POOL_MAX` | no | environment-dependent | Set `2` for Vercel's per-instance pool |
 | `PLAYER_COOKIE_SECRET` | yes | — | HMAC key for the player cookie (≥32 chars). Changing it invalidates existing player cookies |
 | `DATABASE_SSL` | no | `false` | Set `true` for providers that require TLS |
 | `COOKIE_SECURE` | no | `true` in production | `false` only when serving over plain HTTP |
@@ -444,7 +468,7 @@ docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=bpg_de
 | `ALLOW_SIMULATED_PRICES` | no | `false` | Deliberate opt-in required to run simulated prices in production |
 | `COINBASE_API_BASE` | no | `https://api.exchange.coinbase.com` | Override for testing/mocking |
 | `PRICE_FETCH_TIMEOUT_MS` | no | `4000` | Provider request timeout |
-| `SETTLEMENT_SCHEDULER_ENABLED` | no | `true` | Set `false` on all but one instance when scaling out |
+| `SETTLEMENT_SCHEDULER_ENABLED` | no | `true` outside Vercel | Forced off on Vercel; optional timer for local/container hosts |
 | `SETTLEMENT_INTERVAL_MS` | no | `5000` | Sweep interval |
 | `SETTLEMENT_SECRET` | no | unset | When set, enables `POST /api/settle` for an external cron |
 | `TEST_DATABASE_URL` | no | local sandbox default | Database used by integration tests |
@@ -481,7 +505,7 @@ npm start          # run the production build
 npm run typecheck   # tsc --noEmit
 npm run lint        # eslint
 npm test            # vitest: unit + integration
-npm run test:unit   # no database required
+npm run test:unit   # current Vitest global setup still requires TEST_DATABASE_URL
 ```
 
 ### What has been run, and what it reported
@@ -490,7 +514,7 @@ npm run test:unit   # no database required
 | --- | --- |
 | `npm run typecheck` | clean |
 | `npm run lint` | 0 errors, 0 warnings |
-| `npm test` | **160 tests passing** across 10 files |
+| `npm test` | **170 tests passing**, including request/cron race coverage (16 October 2026) |
 | `npm run build` | production build succeeds (105 kB first load) |
 | `node scripts/smoke.mjs --expect-simulated` | **14/14 checks** (full journey over HTTP) |
 
@@ -561,8 +585,8 @@ npm run ci          # typecheck + lint + tests + production build
    do not disable certificate validation. Do not expose these as NEXT_PUBLIC.
 4. Deploy `main` using the Next.js preset. `vercel.json` specifies Frankfurt
    and bounded 30-second API requests; it deliberately has no Vercel cron.
-5. In cron-job.org Free, create one job every 15 minutes, HTTP POST to the
-   production `/api/settle`, with custom header `x-settlement-secret` matching
+5. In cron-job.org Free, create one job every 15 minutes, HTTP POST to
+   `https://bitcoin-prediction-game-khaki.vercel.app/api/settle`, with custom header `x-settlement-secret` matching
    `SETTLEMENT_SECRET`. Keep that secret out of the URL. Enable failure email
    notifications. Verify successful execution history; merely configuring the
    header does not prove the job ran. The production URL must be publicly
@@ -581,9 +605,8 @@ minute-level cron. Monitor free compute usage; do not upgrade automatically.
 
 The container instructions below are retained as an alternative only.
 
-**Not yet deployed, so no public URL is claimed here.** Everything needed is in
-the repository and the steps below have been exercised locally in production
-mode; only the account-specific part remains.
+The selected deployment is live at https://bitcoin-prediction-game-khaki.vercel.app.
+The following container path is an alternative, not the running Vercel topology.
 
 ### Target shape
 
@@ -670,13 +693,14 @@ dashboard shows.
 
 Honest list; the reasoning is in [DECISIONS.md](DECISIONS.md).
 
-- **Settlement is timer-based inside the web process.** On a host that suspends
-  idle containers, ticks are delayed until it wakes. Predictions then settle
-  late — never wrongly, because eligibility is computed from the stored
-  `created_at`. A serverless deployment would rely on an external cron hitting
-  `/api/settle` at minute granularity, i.e. late by design.
-- **Multiple instances are safe but wasteful.** N schedulers would each poll the
-  provider; `SETTLEMENT_SCHEDULER_ENABLED=false` exists for that reason.
+- **Idle settlement needs the external cron.** State requests drive active play;
+  the planned 15-minute job provides the background fallback. Execution is still
+  unverified. Idle resolution may occur roughly 15 minutes later or longer during
+  outages or unchanged prices. Later quotes can change the outcome; this is not
+  an exact-price-at-second-60 game.
+- **Concurrent triggers are safe but consume resources.** Atomic settlement
+  prevents double scoring; overlapping sweeps may still fetch multiple quotes.
+  Free hosting and database quotas are finite.
 - **A prediction can stay open indefinitely** if the price never moves between
   the entry quote and successive sweeps (see A1).
 - **Identity is integrity, not authentication.** Clearing the cookie means a new

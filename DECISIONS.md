@@ -28,13 +28,26 @@ TLS connection URL. Limit Vercel pools to two connections per instance.
 Related files: src/server/http/handlers.ts, src/server/config.ts,
 src/instrumentation.ts, src/server/db/pool.ts, next.config.ts, vercel.json,
 package.json, tests/integration/http.test.ts, tests/unit/config.test.ts.
-Public deployment and external cron verification remain pending.
+Deployment verification (16 October 2026): the application is live at
+https://bitcoin-prediction-game-khaki.vercel.app. Neon migrations were applied.
+Health reported database up, Coinbase with `simulated:false`,
+`schedulerEnabled=false`, `schedulerRunning=false`, `requestTriggered=true`,
+and `externalTriggerConfigured=true`.
+
+A real production UP prediction (`8fb83f27…`) entered at $81,935.05 at
+`10:17:46.723Z`, then resolved as a loss at `10:18:57.812Z`, using $81,905.00
+from quote time `10:18:55.930Z` (UTC). Score moved to −1 once and remained
+stable across repeated reads. Local typecheck, lint, production build, and all
+170 tests passed; production dependency audit reported zero vulnerabilities.
+These results verify the request-triggered deployment. Actual cron-job.org
+setup/execution and a closed-browser production round remain unverified.
 
 A running log, written as decisions were made. Each entry records the context,
 the choice, the alternative that was rejected, and the honest trade-off. Where a
 decision was informed by an experiment, the commands and results are included.
 
-Ordered oldest first.
+D23 is the current deployment decision. Earlier entries follow in historical
+order; D3's container hosting choice is superseded for the public deployment.
 
 ---
 
@@ -134,6 +147,9 @@ for entry and settlement, which is what makes the comparison meaningful.
 
 ## D3 — A long-running process with an in-process scheduler, not serverless
 
+Historical choice, superseded for public hosting by D23 on 16 October 2026.
+The timer implementation remains available for local/container deployments.
+
 **Context.** A prediction must resolve whether or not the player keeps the page
 open. A per-request check cannot guarantee that: the player may close the tab and
 never return. Something server-side has to drive resolution on a timer.
@@ -161,9 +177,9 @@ boot, which is what makes restarts recover rather than lose work.
 **Trade-offs, stated plainly (these are real limitations):**
 
 1. **Suspension.** On a host that idles containers to zero, ticks do not fire
-   while suspended. Predictions settle late. They never settle *incorrectly*,
-   because eligibility is computed from the stored `created_at`, so the first
-   tick after waking resolves everything overdue.
+   while suspended. Predictions settle late. Minimum-wait invariants still hold,
+   but a later quote can change the outcome. A later sweep resolves only records
+   with an eligible changed quote.
 2. **Restart.** Nothing is held in memory. Pending work lives in Postgres.
 3. **Multiple instances.** Safe but redundant: two schedulers racing is resolved
    by the conditional settlement update (D4) — one wins, the other becomes a
@@ -462,11 +478,13 @@ against different prices.
 sweep becomes a single, consistent observation of the market, and the provider
 timestamp recorded on each row keeps it auditable.
 
-**Trade-off.** With a large batch, an early prediction in the batch is settled
-using a price up to one sweep interval after its own deadline (bounded by the
-5-second tick, and by `RULES.settlementBatchSize`). For a 60-second game with a
-5-second tick this is well inside the noise. At higher volume the batch would
-need chunking and the trade-off would have to be revisited (D15).
+**Trade-off.** Each batch shares a market observation, but trigger cadence,
+provider availability and backlog determine how late that observation is.
+The original container used a five-second tick, not a guaranteed maximum delay.
+D23 supersedes that cadence for public hosting: active state requests or a
+15-minute external cron trigger sweeps. A delayed quote can change outcomes.
+At higher volume, batching and backlog need measurement before claiming any
+latency bound.
 
 **Files.** `src/server/settlement/runner.ts`.
 

@@ -16,7 +16,17 @@ build passed. The production dependency audit reported zero vulnerabilities.
 
 Delayed settlement uses a later market quote and can change the outcome.
 This is a documented zero-cost trade-off, not a claim to settle at exactly
-60 seconds. Public deployment and cron execution are still unverified.
+60 seconds. The public application is deployed at
+https://bitcoin-prediction-game-khaki.vercel.app (16 October 2026), with Neon
+migrations applied and Coinbase reporting `simulated:false`. Health confirms
+the scheduler is off, request-triggered settlement is on, and an external
+secret is configured. Actual cron-job.org execution remains unverified.
+
+The verified production UP round `8fb83f27…` entered at $81,935.05 at
+`10:17:46.723Z`, then lost at $81,905.00, resolved at `10:18:57.812Z` using
+the quote from `10:18:55.930Z` (all UTC, 16 October). Score became −1 and
+repeated reads left it unchanged. This proves request-triggered production
+settlement, not a closed-browser scheduled run.
 
 Notes for explaining this project to another engineer. Talking points, not a
 script. Every claim here is something I can point at in the code or in a command
@@ -37,7 +47,7 @@ Suggested shape for a 20-minute session:
 ## 0. Opening (60 seconds, say it naturally)
 
 > "It's a one-minute prediction game. You see the BTC/USD price and your score,
-> you pick higher or lower, and a minute later the server tells you whether you
+> you pick higher or lower, and after at least a minute the server tells you whether you
 > were right and moves your score by one point.
 >
 > The UI is small on purpose. Almost all the effort went into the fact that the
@@ -49,9 +59,10 @@ Suggested shape for a 20-minute session:
 > decides. The browser never sends a price, never sends a player ID, never
 > computes a score, and its clock has no authority.
 >
-> Concretely that's 160 tests, a schema that enforces the rules as constraints,
-> and a settlement loop that runs on a timer in the server process and doesn't
-> need your tab open."
+> Concretely that's 170 tests and a schema that enforces the rules as constraints.
+> On Vercel, state requests trigger the settlement sweep. A 15-minute external
+> cron is the planned fallback when the tab is closed; its execution still needs
+> verification. Delayed settlement uses a later price and can change the result."
 
 ---
 
@@ -103,8 +114,9 @@ The thing to show is the loop and the states, not the visuals.
 4. **Try to predict again.** Buttons are disabled. If you force a second request
    (curl, or a second tab), you get a 409 and the UI resyncs from the state the
    server returns in the error.
-5. **Wait.** Do nothing. Around 60–65 seconds later the result appears, the score
-   changes, and the buttons come back.
+5. **Wait.** With active polling and an eligible changed quote, the result normally
+   appears soon after 60 seconds. The score changes and the buttons return.
+   Provider failures or unchanged prices can extend the wait.
 6. **Refresh.** Score and history are still there — they were never in the client.
 7. **Optional, worth doing:** `curl` the API directly and show that the entry
    price comes from the server, not from anything the client sent.
@@ -124,7 +136,7 @@ Browser ──HTTP──► Route handlers ──► Game service ──► Doma
                        │                  └──► Coinbase    └── (no I/O at all)
                        │                          (entry)
                        ▼
-                  PostgreSQL  ◄──── Settlement sweep ◄──── Scheduler (setInterval)
+                  PostgreSQL  ◄──── Settlement sweep ◄──── State request / external cron
                   (state + constraints)   │
                                           └──► Coinbase (settlement, one quote per sweep)
 ```
@@ -148,9 +160,10 @@ named reason to wait. No database, no clock, no network.
 the application: one pending prediction per player, no early resolution, the
 outcome has to match the price movement.
 
-**The scheduler** is a `setInterval` in the web process. It calls a stateless
-sweep, which discovers its work by querying the database. That's why restarts and
-multiple instances are safe — nothing is remembered in memory.
+**The triggers** are state requests and the protected external cron endpoint.
+Both call the same stateless sweep, which discovers work in PostgreSQL. The
+in-process interval is disabled on Vercel and retained for local/container use.
+Pending state survives restarts, and atomic updates make overlapping sweeps safe.
 
 One place where I deviated from the obvious design: **the database clock is the
 clock of record.** `created_at` and `resolved_at` come from Postgres, the sweep
@@ -249,7 +262,7 @@ isn't decorative.
 ```bash
 npm run typecheck   # clean
 npm run lint        # 0 errors, 0 warnings
-npm test            # 160 tests, 10 files, all passing
+npm test            # 170 tests, all passing (16 October 2026)
 npm run build       # production build OK
 node scripts/smoke.mjs --expect-simulated   # 14/14 checks
 ```
@@ -279,7 +292,7 @@ because `(outcome='win') = (entry > entry)` is `true = false`… which is false,
 `(outcome='loss')` isn't excluded by that biconditional either. The constraint now
 requires `settlement_price <> entry_price` as well.
 
-**Restart recovery, demonstrated:** I created a prediction, killed the server
+**Local/container restart recovery, demonstrated (not Vercel cron proof):** I created a prediction, killed the server
 before its window elapsed, waited past the deadline with the process down,
 confirmed the row was still `pending` in the database, then restarted. The boot
 sweep settled it immediately (`prediction_settled` in the logs), the score moved
@@ -287,11 +300,10 @@ once, and the same cookie could play again. Nothing lives in process memory.
 
 ### Trade-offs — what I deliberately didn't do
 
-- **No AWS.** Managed Postgres plus one container satisfies every requirement. I
-  wasn't going to add IAM, a VPC and a scheduler to a half-day exercise to make a
-  diagram look more impressive. The app is portable — `DATABASE_URL` and
-  `POST /api/settle` mean App Runner + RDS + EventBridge is a config change, not a
-  rewrite.
+- **No AWS.** The selected free deployment uses Vercel, Neon and cron-job.org.
+  This adds an explicit idle-settlement delay and requires cron verification.
+  The container remains an alternative; moving to AWS would require deployment
+  configuration and operational verification, not changes to the domain rules.
 - **No ORM.** The important query is a data-modifying CTE that updates two tables;
   an ORM would have made it harder to read, not easier.
 - **No per-prediction timers.** They die on redeploy and strand the prediction
@@ -302,9 +314,9 @@ once, and the same cookie could play again. Nothing lives in process memory.
 
 ### Limitations I'd volunteer before being asked
 
-1. **Suspension.** On a host that idles containers to zero, ticks don't fire while
-   asleep. Predictions settle late — never wrongly, because eligibility is
-   computed from stored `created_at`, but late.
+1. **Idle settlement delay.** With no requests, the external 15-minute cron must
+   drive settlement. It still needs execution verification. A later quote can
+   change the outcome, even though minimum-wait and scoring invariants hold.
 2. **Identity is integrity, not authentication.** The signature stops you
    impersonating a specific player; it doesn't stop you clearing your cookie and
    starting fresh. Scores aren't a competitive ranking.
@@ -375,9 +387,11 @@ pending and the sweep retries; the score is untouched. That's `provider_unavaila
 in `decideSettlement`, and it's covered by tests at both levels.
 
 **What if the browser closes?**
-Nothing. Settlement is a timer in the server process that reads pending rows from
-the database. I verified this by killing the server mid-round and restarting it
-after the deadline — it settled on boot.
+The prediction persists in PostgreSQL. On the chosen Vercel deployment, the
+15-minute external cron must run the sweep when there are no state requests.
+That execution is still unverified; configuring its secret is not proof. The
+earlier local/container restart test demonstrated boot recovery, but does not
+verify hosted background processing. Delayed quotes can produce a different result.
 
 **What prevents duplicate predictions?**
 A partial unique index, not an application check. The service *also* checks, but
