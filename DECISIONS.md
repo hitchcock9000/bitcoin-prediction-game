@@ -1,5 +1,35 @@
 # Engineering decisions
 
+## D23 — Free serverless delivery (16 October 2026)
+
+Context: the user requires zero hosting cost and approved Vercel Hobby, Neon
+Free and cron-job.org Free instead of a paid long-running container.
+
+Decision: await the existing bounded settlement sweep in GET /api/state before
+reading results. Use the existing secret-protected POST /api/settle every
+15 minutes as a background fallback. Force interval scheduling off on Vercel;
+retain it for local/container use. Domain rules, migrations and atomic scoring
+SQL remain unchanged. Add tests for request/cron races and request failures.
+
+Trade-off: active players normally receive a result soon after 60 seconds via
+three-second polling. With no traffic, settlement can take approximately another
+15 minutes or longer during outages/unchanged prices. A later observed price
+can change the outcome. Minute-by-minute cron was rejected because it prevents
+Neon's five-minute idle suspension and may exhaust its free compute allowance.
+Free quotas are finite; no paid resources or automatic upgrades are authorized.
+
+Security maintenance: update Next.js and its lint config from 15.5.4 to 15.5.28
+within the existing release line. Override its PostCSS dependency to 8.5.30
+and refresh Sharp to its compatible patched release. This avoids a framework
+major upgrade while addressing production advisories. Enable certificate
+verification when explicitly configuring database TLS; Neon uses its supplied
+TLS connection URL. Limit Vercel pools to two connections per instance.
+
+Related files: src/server/http/handlers.ts, src/server/config.ts,
+src/instrumentation.ts, src/server/db/pool.ts, next.config.ts, vercel.json,
+package.json, tests/integration/http.test.ts, tests/unit/config.test.ts.
+Public deployment and external cron verification remain pending.
+
 A running log, written as decisions were made. Each entry records the context,
 the choice, the alternative that was rejected, and the honest trade-off. Where a
 decision was informed by an experiment, the commands and results are included.

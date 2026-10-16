@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createGameStore } from '@/server/game/store';
 import { createGameService } from '@/server/game/service';
 import { createHandlers, type Handlers } from '@/server/http/handlers';
@@ -11,6 +11,7 @@ import {
   getScore,
   insertBackdatedPrediction,
   newPlayerId,
+  readPrediction,
   resetDatabase,
   testPool,
 } from '../helpers/db';
@@ -39,7 +40,12 @@ function cookieFrom(response: Response): string | null {
 }
 
 function makeHandlers(
-  options: { provider?: PriceProvider; settlementSecret?: string | null } = {},
+  options: {
+    provider?: PriceProvider;
+    settlementProvider?: PriceProvider;
+    settlementSecret?: string | null;
+    log?: (event: string, data: Record<string, unknown>) => void;
+  } = {},
 ): { handlers: Handlers; provider: PriceProvider; store: ReturnType<typeof createGameStore> } {
   const store = createGameStore(testPool());
   const provider = options.provider ?? fixedPrice('82000.00');
@@ -49,12 +55,13 @@ function makeHandlers(
     store,
     service,
     displayProvider: provider,
-    settlementProvider: provider,
+    settlementProvider: options.settlementProvider ?? provider,
     scheduler: { enabled: true, running: () => true },
     settlementSecret:
       options.settlementSecret === undefined ? SETTLEMENT_SECRET : options.settlementSecret,
     cookieSecret: COOKIE_SECRET,
     cookieSecure: false,
+    log: options.log,
   });
 
   return { handlers, provider, store };
@@ -327,7 +334,12 @@ describe('HTTP API', () => {
 
     it('says it is finalising once the price has moved, without revealing an outcome', async () => {
       const playerId = newPlayerId();
-      const { handlers } = makeHandlers({ provider: fixedPrice('80500.00') });
+      const { handlers } = makeHandlers({
+        provider: fixedPrice('80500.00'),
+        // Display prices cannot decide the result when the live settlement
+        // provider is unavailable, even though the displayed price moved.
+        settlementProvider: failingProvider(),
+      });
       const cookie = `bpg_player=${signFor(playerId)}`;
 
       await insertBackdatedPrediction({ playerId, entryPrice: '80000.00', secondsAgo: 61 });
@@ -353,6 +365,125 @@ describe('HTTP API', () => {
       expect(body.market).toBeNull();
       expect(body.marketUnavailable).toBe(true);
       expect(body.activePrediction).not.toBeNull();
+    });
+  });
+
+  describe('GET /api/state — request-triggered settlement', () => {
+    it('returns a due result and its score in the same state response', async () => {
+      const playerId = newPlayerId();
+      const { handlers } = makeHandlers({ provider: fixedPrice('80100.00') });
+      const predictionId = await insertBackdatedPrediction({
+        playerId, entryPrice: '80000.00', secondsAgo: 61,
+      });
+      const cookie = `bpg_player=${signFor(playerId)}`;
+
+      const response = await handlers.handleState(stateRequest(cookie));
+      const body = (await response.json()) as GameStateView;
+
+      expect(response.status).toBe(200);
+      expect(body.player.score).toBe(1);
+      expect(body.activePrediction).toBeNull();
+      expect(body.latestPrediction).toMatchObject({ status: 'resolved', outcome: 'win', scoreDelta: 1 });
+      expect(await readPrediction(predictionId)).toMatchObject({ status: 'resolved', outcome: 'win' });
+      // Refresh/retry uses the persisted result and cannot score it again.
+      const again = await handlers.handleState(stateRequest(cookie));
+      expect(((await again.json()) as GameStateView).player.score).toBe(1);
+      expect(await getScore(playerId)).toBe(1);
+    });
+
+    it.each([
+      { name: 'before 60 seconds', secondsAgo: 10, price: '80100.00' },
+      { name: 'when the price is unchanged', secondsAgo: 61, price: '80000.00' },
+    ])('keeps the prediction pending $name', async ({ secondsAgo, price }) => {
+      const playerId = newPlayerId();
+      const { handlers } = makeHandlers({ provider: fixedPrice(price) });
+      const predictionId = await insertBackdatedPrediction({ playerId, entryPrice: '80000.00', secondsAgo });
+
+      const response = await handlers.handleState(stateRequest(`bpg_player=${signFor(playerId)}`));
+      const body = (await response.json()) as GameStateView;
+
+      expect(response.status).toBe(200);
+      expect(body.player.score).toBe(0);
+      expect(body.activePrediction).not.toBeNull();
+      expect(await readPrediction(predictionId)).toMatchObject({ status: 'pending', outcome: null });
+      expect(await getScore(playerId)).toBe(0);
+    });
+
+    it('keeps a due prediction pending and returns state during provider failure', async () => {
+      const playerId = newPlayerId();
+      const { handlers } = makeHandlers({ provider: failingProvider() });
+      const predictionId = await insertBackdatedPrediction({
+        playerId, entryPrice: '80000.00', secondsAgo: 61,
+      });
+
+      const response = await handlers.handleState(stateRequest(`bpg_player=${signFor(playerId)}`));
+      const body = (await response.json()) as GameStateView;
+
+      expect(response.status).toBe(200);
+      expect(body.player.score).toBe(0);
+      expect(body.activePrediction).not.toBeNull();
+      expect(body.marketUnavailable).toBe(true);
+      expect(await readPrediction(predictionId)).toMatchObject({ status: 'pending', outcome: null });
+      expect(await getScore(playerId)).toBe(0);
+    });
+
+    it('logs a failed sweep while still returning persisted game state', async () => {
+      const playerId = newPlayerId();
+      const log = vi.fn();
+      const { handlers, store } = makeHandlers({ log });
+      const predictionId = await insertBackdatedPrediction({
+        playerId, entryPrice: '80000.00', secondsAgo: 61,
+      });
+      const sweepQuery = vi.spyOn(store, 'listSweepable').mockRejectedValueOnce(new Error('Temporary sweep query failure'));
+      try {
+        const response = await handlers.handleState(stateRequest(`bpg_player=${signFor(playerId)}`));
+        const body = (await response.json()) as GameStateView;
+        expect(response.status).toBe(200);
+        expect(body.player.score).toBe(0);
+        expect(body.activePrediction).not.toBeNull();
+        expect(await readPrediction(predictionId)).toMatchObject({ status: 'pending', outcome: null });
+        expect(log).toHaveBeenCalledWith('request_settle_failed', { message: 'Temporary sweep query failure' });
+      } finally {
+        sweepQuery.mockRestore();
+      }
+    });
+
+    it('scores exactly once when state polling races the authenticated settlement trigger', async () => {
+      const playerId = newPlayerId();
+      const provider = fixedPrice('80100.00');
+      let release!: () => void;
+      const bothSweepsReady = new Promise<void>(resolve => { release = resolve; });
+      let arrivals = 0;
+      const settlementProvider = new StubPriceProvider(async () => {
+        // Both requests must have selected the pending row before either can
+        // resolve it, exercising the database's conditional write race.
+        arrivals += 1;
+        if (arrivals === 2) release();
+        await bothSweepsReady;
+        return provider.getQuote();
+      });
+      const { handlers } = makeHandlers({ provider, settlementProvider });
+      const predictionId = await insertBackdatedPrediction({
+        playerId, entryPrice: '80000.00', secondsAgo: 61,
+      });
+      const cookie = `bpg_player=${signFor(playerId)}`;
+
+      const responses = await Promise.all([
+        handlers.handleState(stateRequest(cookie)),
+        handlers.handleSettle(new Request('http://test.local/api/settle', {
+          method: 'POST',
+          headers: { 'x-settlement-secret': SETTLEMENT_SECRET },
+        })),
+      ]);
+
+      expect(responses.map(response => response.status)).toEqual([200, 200]);
+      expect(arrivals).toBe(2);
+      expect(await getScore(playerId)).toBe(1);
+      expect(await readPrediction(predictionId)).toMatchObject({ status: 'resolved', outcome: 'win' });
+      const response = await handlers.handleState(stateRequest(cookie));
+      const body = (await response.json()) as GameStateView;
+      expect(body.player.score).toBe(1);
+      expect(body.activePrediction).toBeNull();
     });
   });
 

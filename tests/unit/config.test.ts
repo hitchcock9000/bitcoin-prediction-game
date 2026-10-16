@@ -73,4 +73,16 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...BASE_ENV }).settlementSecret).toBeNull();
     expect(loadConfig({ ...BASE_ENV, SETTLEMENT_SECRET: 'trigger-me' }).settlementSecret).toBe('trigger-me');
   });
+
+  it('disables the in-process scheduler on Vercel even when explicitly enabled', () => {
+    for (const setting of [undefined, 'true', 'false']) {
+      expect(loadConfig({
+        ...BASE_ENV,
+        VERCEL: '1',
+        SETTLEMENT_SCHEDULER_ENABLED: setting,
+      }).settlementSchedulerEnabled).toBe(false);
+    }
+    expect(loadConfig({ ...BASE_ENV }).settlementSchedulerEnabled).toBe(true);
+    expect(loadConfig({ ...BASE_ENV, SETTLEMENT_SCHEDULER_ENABLED: 'false' }).settlementSchedulerEnabled).toBe(false);
+  });
 });

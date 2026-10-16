@@ -5,6 +5,8 @@
  * property of the running server rather than of any particular request.
  */
 export async function register(): Promise<void> {
+  // Request lifetimes cannot host a reliable interval scheduler on Vercel.
+  if (process.env.VERCEL === '1') return;
   // `next build` also loads instrumentation. Booting a scheduler during a build
   // would be pointless and would fail on machines with no database.
   if (process.env.NEXT_PHASE === 'phase-production-build') return;

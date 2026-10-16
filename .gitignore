@@ -18,3 +18,7 @@ next-env.d.ts
 
 .DS_Store
 *.log
+.vercel/
+test-results/
+.vercel
+.env*

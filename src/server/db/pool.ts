@@ -13,8 +13,8 @@ export function getPool(): Pool {
     const config = getConfig();
     const pool = new Pool({
       connectionString: config.databaseUrl,
-      ssl: config.databaseSsl ? { rejectUnauthorized: false } : undefined,
-      max: Number(process.env.DATABASE_POOL_MAX ?? 10),
+      ssl: config.databaseSsl ? { rejectUnauthorized: true } : undefined,
+      max: Number(process.env.DATABASE_POOL_MAX ?? (process.env.VERCEL === '1' ? 2 : 10)),
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
     });

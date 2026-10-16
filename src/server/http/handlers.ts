@@ -186,7 +186,14 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       const currentTime = now();
       try {
         const identity = resolveIdentity(request, currentTime);
-        const payload = await buildStatePayload(identity.playerId, currentTime);
+        // Await work inside the request: serverless instances may stop after
+        // responding. Cron invokes this same bounded, idempotent sweep.
+        try {
+          await runSettlementSweep({ store: deps.store, provider: deps.settlementProvider, log });
+        } catch (error) {
+          log('request_settle_failed', { message: error instanceof Error ? error.message : String(error) });
+        }
+        const payload = await buildStatePayload(identity.playerId, now());
         return json(payload, { setCookie: identity.setCookie });
       } catch (error) {
         log('state_failed', { message: error instanceof Error ? error.message : String(error) });
@@ -339,6 +346,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
             schedulerEnabled: deps.scheduler.enabled,
             schedulerRunning: deps.scheduler.running(),
             externalTriggerConfigured: deps.settlementSecret !== null,
+            requestTriggered: true,
           },
           pending,
           serverTime: now().toISOString(),

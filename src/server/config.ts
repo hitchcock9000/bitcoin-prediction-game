@@ -95,7 +95,7 @@ export function loadConfig(env: EnvSource = process.env): AppConfig {
     priceProvider,
     coinbaseApiBase: env.COINBASE_API_BASE ?? 'https://api.exchange.coinbase.com',
     priceFetchTimeoutMs: Number(env.PRICE_FETCH_TIMEOUT_MS ?? 4000),
-    settlementSchedulerEnabled: env.SETTLEMENT_SCHEDULER_ENABLED !== 'false',
+    settlementSchedulerEnabled: env.VERCEL !== '1' && env.SETTLEMENT_SCHEDULER_ENABLED !== 'false',
     settlementIntervalMs: Number(env.SETTLEMENT_INTERVAL_MS ?? 5000),
     settlementSecret: env.SETTLEMENT_SECRET && env.SETTLEMENT_SECRET.length > 0 ? env.SETTLEMENT_SECRET : null,
   };

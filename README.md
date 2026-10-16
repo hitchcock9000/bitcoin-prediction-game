@@ -1,5 +1,22 @@
 # Bitcoin prediction game
 
+> Deployment update (16 October 2026): the approved target is Vercel Hobby +
+> Neon Free + cron-job.org Free, with no paid add-ons. The server now awaits a
+> bounded settlement sweep on state requests; the 15-minute external cron is a
+> fallback when no browser is open. The in-process scheduler is disabled on
+> Vercel. Deployment is not yet verified; no public URL is claimed.
+>
+> A delayed sweep uses a later eligible market quote, so delay can affect the
+> outcome, not just when the result appears. The original domain policy and
+> database constraints are unchanged. Older container deployment instructions
+> below remain an alternative, not the selected hosting plan.
+
+Serverless-change checks (16 October 2026): typecheck, lint, all **170 tests**
+against isolated real PostgreSQL, and production build passed. Tests include
+overlapping state-request and authenticated cron settlement. Production-only
+dependency audit: **zero vulnerabilities**. Development tooling still has audit
+findings; this is not a claim that the entire dependency tree is clear.
+
 A small web game: predict whether the market price of BTC/USD will be **higher**
 or **lower** one minute from now. Correct predictions add a point, incorrect ones
 subtract a point, and scores persist in PostgreSQL.
@@ -528,6 +545,41 @@ npm run ci          # typecheck + lint + tests + production build
 ---
 
 ## Deployment
+
+### Selected zero-cost deployment: Vercel Hobby + Neon Free
+
+1. Keep the Vercel scope on Hobby and create Neon on Free (no paid add-ons or
+   trial upgrades). Select Frankfurt for both. Neon usage must remain within
+   its free quota; a public demo is not an unlimited-capacity service.
+2. Store Neon's pooled TLS URL as `DATABASE_URL` in `.env.local` and its direct
+   URL as `DATABASE_MIGRATION_URL`. Neither is committed. Run `npm run db:migrate`;
+   the migration CLI prefers the direct URL. Never run migrations on requests.
+3. Set Vercel production environment variables: `DATABASE_URL`, a generated
+   `PLAYER_COOKIE_SECRET`, a separate generated `SETTLEMENT_SECRET`,
+   `PRICE_PROVIDER=coinbase`, `SETTLEMENT_SCHEDULER_ENABLED=false`,
+   `DATABASE_POOL_MAX=2`. Keep secure cookies enabled. Use Neon's TLS URL and
+   do not disable certificate validation. Do not expose these as NEXT_PUBLIC.
+4. Deploy `main` using the Next.js preset. `vercel.json` specifies Frankfurt
+   and bounded 30-second API requests; it deliberately has no Vercel cron.
+5. In cron-job.org Free, create one job every 15 minutes, HTTP POST to the
+   production `/api/settle`, with custom header `x-settlement-secret` matching
+   `SETTLEMENT_SECRET`. Keep that secret out of the URL. Enable failure email
+   notifications. Verify successful execution history; merely configuring the
+   header does not prove the job ran. The production URL must be publicly
+   accessible without Vercel login protection.
+6. Verify live Coinbase, score persistence, the real 60-second game flow, and
+   a closed-browser round resolved by an actual scheduled execution. Health
+   should show `schedulerEnabled=false`, `schedulerRunning=false`,
+   `requestTriggered=true`, and `externalTriggerConfigured=true`.
+
+State polling is the normal experience and awaits the shared settlement sweep.
+Cron is only the idle fallback. Both may race safely through atomic settlement.
+If no player visits, resolution can be delayed by roughly 15 minutes, plus
+provider outages or unchanged prices. Later pricing can change the outcome.
+The chosen cadence lets Neon suspend between idle jobs, unlike a permanent
+minute-level cron. Monitor free compute usage; do not upgrade automatically.
+
+The container instructions below are retained as an alternative only.
 
 **Not yet deployed, so no public URL is claimed here.** Everything needed is in
 the repository and the steps below have been exercised locally in production

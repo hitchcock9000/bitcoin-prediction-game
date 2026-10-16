@@ -1,5 +1,23 @@
 # Engineering walkthrough
 
+## Serverless delivery update — 16 October 2026
+
+The selected hosting is Vercel Hobby, Neon Free and cron-job.org Free.
+State requests await the existing settlement sweep before reading results.
+The browser polls every three seconds, so active play normally resolves soon
+after the minimum wait. The browser never decides the outcome. A protected
+15-minute cron sweep is the fallback when no one has the game open. There is
+no in-process timer on Vercel. Both triggers use the same domain rules and
+atomic PostgreSQL statement, so overlapping executions cannot score twice.
+
+Verified locally on 16 October: 170 tests passed against real PostgreSQL,
+including a barrier-controlled request/cron race. Typecheck, lint and production
+build passed. The production dependency audit reported zero vulnerabilities.
+
+Delayed settlement uses a later market quote and can change the outcome.
+This is a documented zero-cost trade-off, not a claim to settle at exactly
+60 seconds. Public deployment and cron execution are still unverified.
+
 Notes for explaining this project to another engineer. Talking points, not a
 script. Every claim here is something I can point at in the code or in a command
 I actually ran.
