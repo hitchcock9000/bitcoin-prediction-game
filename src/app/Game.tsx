@@ -144,7 +144,8 @@ export default function Game() {
   );
 
   const activePrediction = state?.activePrediction ?? null;
-  const resolutionPending = activePrediction !== null && (secondsLeft ?? 0) === 0;
+  const resolutionPending =
+    activePrediction !== null && (secondsLeft ?? activePrediction.secondsRemaining) === 0;
 
   const lastResult = useMemo(() => {
     if (!state?.latestPrediction) return null;
@@ -160,10 +161,9 @@ export default function Game() {
   if (!state && !initialLoadError) {
     return (
       <main className="page" aria-busy="true">
-        <p className="blocked-hint" role="status">
-          Loading the game…
-        </p>
-        <div className="skeleton" />
+        <div className="loading-mark" aria-hidden="true">₿</div>
+        <p className="blocked-hint" role="status">Opening the market…</p>
+        <div className="skeleton skeleton--hero" />
         <div className="skeleton" />
       </main>
     );
@@ -172,8 +172,9 @@ export default function Game() {
   if (!state) {
     return (
       <main className="page">
-        <div className="card status">
-          <div className="status__headline">Could not load the game</div>
+        <div className="card status" role="alert">
+          <span className="section-label">Connection issue</span>
+          <h1 className="status__headline">Could not load the game</h1>
           <p className="status__detail">{initialLoadError}</p>
           <button type="button" className="retry" onClick={() => void load()}>
             Try again
@@ -204,9 +205,15 @@ export default function Game() {
       )}
 
       <header className="header">
-        <div>
-          <h1 className="header__title">BTC / USD — 1 minute</h1>
-          <p className="header__subtitle">Predict where the price will be in a minute.</p>
+        <div className="brand">
+          <span className="brand__mark" aria-hidden="true">₿</span>
+          <div>
+            <span className="eyebrow">BTC / USD · 60-second minimum</span>
+            <h1 className="header__title">Up or down from here?</h1>
+            <p className="header__subtitle">
+              Choose a direction. The server settles against a later changed market quote.
+            </p>
+          </div>
         </div>
         <div className="score" aria-label={`Your score: ${score}`}>
           <span className="score__label">Score</span>
@@ -220,8 +227,14 @@ export default function Game() {
         </div>
       </header>
 
-      <section className="card price" aria-live="polite">
-        <span className="price__label">Latest BTC/USD price</span>
+      <section className="card price" aria-label="Latest BTC/USD market price">
+        <div className="price__topline">
+          <span className="price__label">Live reference price</span>
+          <span className={`market-status ${priceUnavailable ? 'market-status--offline' : ''}`}>
+            <span className="market-status__dot" aria-hidden="true" />
+            {priceUnavailable ? 'Feed offline' : 'Market live'}
+          </span>
+        </div>
         {priceUnavailable || !state.market ? (
           <>
             <span className="price__value price__value--unavailable">Price unavailable</span>
@@ -240,9 +253,7 @@ export default function Game() {
         )}
       </section>
 
-      {/* Everything transient is announced from one region so screen readers are
-          not flooded by the price updating every few seconds. */}
-      <div aria-live="polite">
+      <div>
         {lastResult && <ResultCard result={lastResult} />}
 
         {activePrediction && (
@@ -273,8 +284,12 @@ export default function Game() {
           disabled={!canPredict}
           aria-describedby="choice-help"
         >
-          <span>{submitting === 'up' ? 'Placing…' : 'Higher'}</span>
-          <span className="choice__hint">UP</span>
+          <span className="choice__topline">
+            <span className="choice__hint">Predict higher</span>
+            <span className="choice__arrow" aria-hidden="true">↗</span>
+          </span>
+          <span className="choice__label">{submitting === 'up' ? 'Placing…' : 'Higher'}</span>
+          <span className="choice__detail">BTC finishes above entry</span>
         </button>
         <button
           type="button"
@@ -283,8 +298,12 @@ export default function Game() {
           disabled={!canPredict}
           aria-describedby="choice-help"
         >
-          <span>{submitting === 'down' ? 'Placing…' : 'Lower'}</span>
-          <span className="choice__hint">DOWN</span>
+          <span className="choice__topline">
+            <span className="choice__hint">Predict lower</span>
+            <span className="choice__arrow" aria-hidden="true">↘</span>
+          </span>
+          <span className="choice__label">{submitting === 'down' ? 'Placing…' : 'Lower'}</span>
+          <span className="choice__detail">BTC finishes below entry</span>
         </button>
       </section>
 
@@ -301,9 +320,15 @@ export default function Game() {
       </p>
 
       <footer className="footer">
-        Settlement runs on the server and does not depend on this page being open.
-        <br />
-        Prices from {state.priceSource.name}.
+        <div className="footer__facts" aria-label="Game guarantees">
+          <span>Server-authoritative</span>
+          <span>One open prediction</span>
+          <span>Exact decimal prices</span>
+        </div>
+        <p>
+          Settlement starts after at least 60 seconds and may wait for a changed price.
+          This page can be closed safely. Prices from {state.priceSource.name}.
+        </p>
       </footer>
     </main>
   );
@@ -326,12 +351,13 @@ function PredictionPending({
 
   return (
     <>
+      <span className="section-label">Open prediction</span>
       <div className="countdown">
         <span className="status__headline">
           {resolutionPending ? 'Settling…' : `You predicted ${prediction.direction === 'up' ? 'higher' : 'lower'}`}
         </span>
         <span className="countdown__value">
-          {resolutionPending ? '' : `${secondsLeft}s`}
+          {resolutionPending ? '00:00' : formatCountdown(secondsLeft)}
         </span>
       </div>
 
@@ -355,6 +381,7 @@ function ResultCard({ result }: { result: NonNullable<GameStateView['latestPredi
   const won = result.outcome === 'win';
   return (
     <div className={`result ${won ? 'result--win' : 'result--loss'}`} role="status">
+      <span className="section-label">Round settled</span>
       <h2 className="result__headline">
         {won ? 'You won' : 'You lost'}
         <span className="result__delta">{won ? '+1 point' : '−1 point'}</span>
@@ -371,6 +398,11 @@ function ResultCard({ result }: { result: NonNullable<GameStateView['latestPredi
       </dl>
     </div>
   );
+}
+
+function formatCountdown(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  return `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
 function formatTime(iso: string): string {
