@@ -34,8 +34,9 @@ pending. I prefer an explicit wait to guessing a result.
 
 While a round is active, the UI polls `GET /api/state` every three seconds. On
 Vercel, that request also runs a bounded settlement sweep, so an active player
-normally sees the result shortly after the threshold. A protected cron request
-runs every 15 minutes as a fallback when nobody has the game open.
+normally sees the result shortly after the threshold. The protected
+`POST /api/settle` endpoint is available for an external cron fallback when
+nobody has the game open.
 
 ## 3. How to run it locally
 
@@ -108,9 +109,10 @@ the chosen rules.
 ### Serverless hosting needs two settlement triggers
 
 Vercel functions cannot own a dependable in-process timer. Active play uses a
-request-triggered sweep; cron-job.org provides the background fallback. Both
-call the same settlement code. PostgreSQL keeps cross-instance overlap safe,
-while overlapping calls inside one warm instance share the same sweep.
+request-triggered sweep; a secret-protected `POST /api/settle` endpoint is
+available for an external cron fallback. Both triggers call the same
+settlement code. PostgreSQL keeps cross-instance overlap safe, while
+overlapping calls inside one warm instance share the same sweep.
 
 ## 5. Testing
 
@@ -150,16 +152,18 @@ GitHub Actions with an isolated PostgreSQL 17 service.
 - **Web:** Vercel Hobby
 - **Database:** Neon Free, Frankfurt
 - **Market data:** Coinbase Exchange BTC/USD ticker
-- **Background fallback:** cron-job.org Free, every 15 minutes
+- **External background fallback:** the deployed demo uses cron-job.org Free on
+  a 15-minute schedule; that schedule is configured outside this repository.
 
 The in-process scheduler is disabled on Vercel. Application traffic uses the
 pooled Neon URL with a small connection pool; migrations use the direct URL.
 The cron endpoint requires a separate secret in the `x-settlement-secret`
-header.
+header. This repository provides the endpoint, not the external cron schedule.
 
 The public deployment was checked with a real Coinbase-backed round and a
 separate cron-only settlement. The health endpoint reports the database up,
-Coinbase active with `simulated: false`, and both settlement triggers configured.
+Coinbase active with `simulated: false`, and whether the external-trigger
+secret is configured. The health endpoint does not verify the cron schedule.
 
 ## 7. Trade-offs and what I'd improve
 
