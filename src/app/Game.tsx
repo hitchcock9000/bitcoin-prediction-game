@@ -22,7 +22,8 @@ import type { ActivePredictionView, ApiErrorBody, ConflictBody, GameStateView } 
  *    treatment, so a player is never left wondering whether a tap registered.
  */
 
-const POLL_INTERVAL_MS = 3_000;
+const ACTIVE_POLL_INTERVAL_MS = 3_000;
+const IDLE_POLL_INTERVAL_MS = 10_000;
 const MIN_WAIT_SECONDS = 60;
 
 type Submitting = 'up' | 'down' | null;
@@ -45,9 +46,11 @@ export default function Game() {
       if (!mountedRef.current) return;
 
       if (!response.ok) {
-        setRefreshError(
-          'error' in body ? body.error.message : 'Could not refresh the game state.',
-        );
+        const message = 'error' in body ? body.error.message : 'Could not refresh the game state.';
+        // initialLoadError owns the no-state screen; refreshError keeps the
+        // last good state visible after a later polling failure.
+        setInitialLoadError(message);
+        setRefreshError(message);
         return;
       }
       setState(body as GameStateView);
@@ -56,25 +59,37 @@ export default function Game() {
     } catch {
       if (!mountedRef.current) return;
       // Keep the last known state on screen; a dropped poll is not a dead app.
-      setRefreshError('Lost contact with the server. Retrying…');
+      const message = 'Lost contact with the server. Retrying…';
+      setInitialLoadError(message);
+      setRefreshError(message);
     }
   }, []);
+
+  const activeId = state?.activePrediction?.id ?? null;
+  const serverSecondsRemaining = state?.activePrediction?.secondsRemaining ?? null;
 
   useEffect(() => {
     mountedRef.current = true;
     void load();
-    const timer = setInterval(() => void load(), POLL_INTERVAL_MS);
+    const pollInterval = activeId ? ACTIVE_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
+    const timer = setInterval(() => {
+      // A hidden tab cannot show a result. Resume immediately when it becomes
+      // visible instead of creating background request and database traffic.
+      if (!document.hidden) void load();
+    }, pollInterval);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       mountedRef.current = false;
       clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [load]);
+  }, [activeId, load]);
 
   // Countdown: resynchronised from every poll response, ticked locally in
   // between. Purely informational (see rule 2 above).
-  const activeId = state?.activePrediction?.id ?? null;
-  const serverSecondsRemaining = state?.activePrediction?.secondsRemaining ?? null;
-
   useEffect(() => {
     if (serverSecondsRemaining === null) {
       setSecondsLeft(null);
