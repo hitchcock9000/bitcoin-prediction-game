@@ -68,7 +68,7 @@ const isDirectRun =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isDirectRun) {
-  const connectionString = process.env.DATABASE_URL;
+  const connectionString = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
   if (!connectionString) {
     console.error('DATABASE_URL is not set. Copy .env.example to .env and fill it in.');
     process.exit(1);
