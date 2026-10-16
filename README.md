@@ -16,8 +16,6 @@ timestamps, result and score changes.
 The deployed app uses real BTC/USD quotes from Coinbase Exchange. It runs on
 Vercel Hobby with Neon Postgres and a cron-job.org fallback, all on free tiers.
 
-For the longer reasoning trail, see [DECISIONS.md](DECISIONS.md).
-
 ## 2. How the game works
 
 1. On the first request, the server creates an anonymous player and stores the
