@@ -104,6 +104,10 @@ describe('readCookie', () => {
     expect(readCookie(`${PLAYER_COOKIE_NAME}=a%2Eb`, PLAYER_COOKIE_NAME)).toBe('a.b');
   });
 
+  it('treats invalid percent-encoding as a malformed cookie', () => {
+    expect(readCookie(`${PLAYER_COOKIE_NAME}=%E0%A4%A`, PLAYER_COOKIE_NAME)).toBeNull();
+  });
+
   it('returns null when absent', () => {
     expect(readCookie('theme=dark', PLAYER_COOKIE_NAME)).toBeNull();
     expect(readCookie(null, PLAYER_COOKIE_NAME)).toBeNull();

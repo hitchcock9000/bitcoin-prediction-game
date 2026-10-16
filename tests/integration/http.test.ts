@@ -15,7 +15,7 @@ import {
   resetDatabase,
   testPool,
 } from '../helpers/db';
-import { failingProvider, fixedPrice, StubPriceProvider } from '../helpers/stubPriceProvider';
+import { failingProvider, fixedPrice, quoteAt, StubPriceProvider } from '../helpers/stubPriceProvider';
 
 /**
  * HTTP-level tests.
@@ -148,6 +148,17 @@ describe('HTTP API', () => {
       expect(await getScore(victim)).toBe(99);
     });
 
+    it('replaces a cookie with invalid percent-encoding instead of returning 500', async () => {
+      const { handlers } = makeHandlers();
+      const response = await handlers.handleState(
+        stateRequest('bpg_player=%E0%A4%A'),
+      );
+
+      expect(response.status).toBe(200);
+      expect(cookieFrom(response)).toMatch(/^bpg_player=/);
+      expect(((await response.json()) as GameStateView).player.score).toBe(0);
+    });
+
     it('never caches game state', async () => {
       const { handlers } = makeHandlers();
       const response = await handlers.handleState(stateRequest());
@@ -255,6 +266,43 @@ describe('HTTP API', () => {
       expect(rows[0].n).toBe(1);
     });
 
+    it('returns 409 when concurrent submissions reach the unique index together', async () => {
+      let entryCalls = 0;
+      let releaseEntries!: () => void;
+      const bothEntriesReady = new Promise<void>((resolve) => {
+        releaseEntries = resolve;
+      });
+      const provider = new StubPriceProvider(async () => {
+        entryCalls += 1;
+        if (entryCalls <= 2) {
+          if (entryCalls === 2) releaseEntries();
+          await bothEntriesReady;
+        }
+        return quoteAt('82000.00', new Date(), 2_000_000 + entryCalls);
+      });
+      const { handlers, store } = makeHandlers({ provider });
+      const playerId = newPlayerId();
+      await store.ensurePlayer(playerId);
+      const cookie = `bpg_player=${signFor(playerId)}`;
+
+      const responses = await Promise.all([
+        handlers.handleCreatePrediction(predictionRequest({ direction: 'up' }, cookie)),
+        handlers.handleCreatePrediction(predictionRequest({ direction: 'down' }, cookie)),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+      const conflict = responses.find((response) => response.status === 409);
+      expect(conflict).toBeDefined();
+      const body = (await conflict!.json()) as ConflictBody;
+      expect(body.error.code).toBe('prediction_already_active');
+      expect(body.state.activePrediction).not.toBeNull();
+
+      const { rows } = await testPool().query(
+        `select count(*)::int as n from predictions where status = 'pending'`,
+      );
+      expect(rows[0].n).toBe(1);
+    });
+
     it('refuses to create a prediction when no price is available', async () => {
       const { handlers } = makeHandlers({ provider: failingProvider('upstream down') });
       const cookie = cookieFrom(await handlers.handleState(stateRequest()));
@@ -269,6 +317,27 @@ describe('HTTP API', () => {
       // Nothing was recorded: a round must never start from an unknown price.
       const { rows } = await testPool().query('select count(*)::int as n from predictions');
       expect(rows[0].n).toBe(0);
+    });
+
+    it('keeps a first-time player identity when entry fails', async () => {
+      const { handlers } = makeHandlers({ provider: failingProvider('upstream down') });
+
+      const first = await handlers.handleCreatePrediction(
+        predictionRequest({ direction: 'up' }),
+      );
+      const cookie = cookieFrom(first);
+
+      expect(first.status).toBe(503);
+      expect(cookie).toMatch(/^bpg_player=/);
+
+      const second = await handlers.handleCreatePrediction(
+        predictionRequest({ direction: 'up' }, cookie),
+      );
+      expect(second.status).toBe(503);
+      expect(second.headers.get('set-cookie')).toBeNull();
+
+      const { rows } = await testPool().query('select count(*)::int as n from players');
+      expect(rows[0].n).toBe(1);
     });
   });
 
@@ -448,7 +517,36 @@ describe('HTTP API', () => {
       }
     });
 
-    it('scores exactly once when state polling races the authenticated settlement trigger', async () => {
+    it('shares an overlapping state and cron sweep inside one server instance', async () => {
+      const playerId = newPlayerId();
+      const settlementProvider = new StubPriceProvider(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return fixedPrice('80100.00').getQuote();
+      });
+      const { handlers } = makeHandlers({
+        provider: fixedPrice('80100.00'),
+        settlementProvider,
+      });
+      await insertBackdatedPrediction({
+        playerId, entryPrice: '80000.00', secondsAgo: 61,
+      });
+      const cookie = `bpg_player=${signFor(playerId)}`;
+
+      const [stateResponse, cronResponse] = await Promise.all([
+        handlers.handleState(stateRequest(cookie)),
+        handlers.handleSettle(new Request('http://test.local/api/settle', {
+          method: 'POST',
+          headers: { 'x-settlement-secret': SETTLEMENT_SECRET },
+        })),
+      ]);
+
+      expect(stateResponse.status).toBe(200);
+      expect(cronResponse.status).toBe(200);
+      expect(settlementProvider.calls).toBe(1);
+      expect(await getScore(playerId)).toBe(1);
+    });
+
+    it('scores exactly once when state and cron race across server instances', async () => {
       const playerId = newPlayerId();
       const provider = fixedPrice('80100.00');
       let release!: () => void;
@@ -462,15 +560,19 @@ describe('HTTP API', () => {
         await bothSweepsReady;
         return provider.getQuote();
       });
-      const { handlers } = makeHandlers({ provider, settlementProvider });
+      // Separate handler graphs simulate two warm serverless instances. Their
+      // in-process overlap guards cannot see each other, so the database still
+      // has to make the write race safe.
+      const firstInstance = makeHandlers({ provider, settlementProvider }).handlers;
+      const secondInstance = makeHandlers({ provider, settlementProvider }).handlers;
       const predictionId = await insertBackdatedPrediction({
         playerId, entryPrice: '80000.00', secondsAgo: 61,
       });
       const cookie = `bpg_player=${signFor(playerId)}`;
 
       const responses = await Promise.all([
-        handlers.handleState(stateRequest(cookie)),
-        handlers.handleSettle(new Request('http://test.local/api/settle', {
+        firstInstance.handleState(stateRequest(cookie)),
+        secondInstance.handleSettle(new Request('http://test.local/api/settle', {
           method: 'POST',
           headers: { 'x-settlement-secret': SETTLEMENT_SECRET },
         })),
@@ -480,7 +582,7 @@ describe('HTTP API', () => {
       expect(arrivals).toBe(2);
       expect(await getScore(playerId)).toBe(1);
       expect(await readPrediction(predictionId)).toMatchObject({ status: 'resolved', outcome: 'win' });
-      const response = await handlers.handleState(stateRequest(cookie));
+      const response = await firstInstance.handleState(stateRequest(cookie));
       const body = (await response.json()) as GameStateView;
       expect(body.player.score).toBe(1);
       expect(body.activePrediction).toBeNull();

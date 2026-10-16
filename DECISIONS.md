@@ -1,837 +1,367 @@
 # Engineering decisions
 
-## D23 — Free serverless delivery (16 October 2026)
-
-Context: the user requires zero hosting cost and approved Vercel Hobby, Neon
-Free and cron-job.org Free instead of a paid long-running container.
-
-Decision: await the existing bounded settlement sweep in GET /api/state before
-reading results. Use the existing secret-protected POST /api/settle every
-15 minutes as a background fallback. Force interval scheduling off on Vercel;
-retain it for local/container use. Domain rules, migrations and atomic scoring
-SQL remain unchanged. Add tests for request/cron races and request failures.
-
-Trade-off: active players normally receive a result soon after 60 seconds via
-three-second polling. With no traffic, settlement can take approximately another
-15 minutes or longer during outages/unchanged prices. A later observed price
-can change the outcome. Minute-by-minute cron was rejected because it prevents
-Neon's five-minute idle suspension and may exhaust its free compute allowance.
-Free quotas are finite; no paid resources or automatic upgrades are authorized.
-
-Security maintenance: update Next.js and its lint config from 15.5.4 to 15.5.28
-within the existing release line. Override its PostCSS dependency to 8.5.30
-and refresh Sharp to its compatible patched release. This avoids a framework
-major upgrade while addressing production advisories. Enable certificate
-verification when explicitly configuring database TLS; Neon uses its supplied
-TLS connection URL. Limit Vercel pools to two connections per instance.
-
-Related files: src/server/http/handlers.ts, src/server/config.ts,
-src/instrumentation.ts, src/server/db/pool.ts, next.config.ts, vercel.json,
-package.json, tests/integration/http.test.ts, tests/unit/config.test.ts.
-Deployment verification (16 October 2026): the application is live at
-https://bitcoin-prediction-game-khaki.vercel.app. Neon migrations were applied.
-Health reported database up, Coinbase with `simulated:false`,
-`schedulerEnabled=false`, `schedulerRunning=false`, `requestTriggered=true`,
-and `externalTriggerConfigured=true`.
-
-A real production UP prediction (`8fb83f27…`) entered at $81,935.05 at
-`10:17:46.723Z`, then resolved as a loss at `10:18:57.812Z`, using $81,905.00
-from quote time `10:18:55.930Z` (UTC). Score moved to −1 once and remained
-stable across repeated reads. Local typecheck, lint, production build, and all
-170 tests passed; production dependency audit reported zero vulnerabilities.
-These results verify the request-triggered deployment. The external path was
-then verified with production prediction `03177572…`: no `/api/state` request
-occurred after creation at `10:42:24.692Z`; cron-job.org sent
-`POST /api/settle` at `10:45:16.680Z` and received 200; PostgreSQL resolved the
-row at `10:45:17.129Z` using a Coinbase quote timestamped `10:45:16.226Z`.
-
-A running log, written as decisions were made. Each entry records the context,
-the choice, the alternative that was rejected, and the honest trade-off. Where a
-decision was informed by an experiment, the commands and results are included.
-
-D23 is the current deployment decision. Earlier entries follow in historical
-order; D3's container hosting choice is superseded for the public deployment.
-
----
-
-## D1 — One pending prediction per player is enforced by a partial unique index
-
-**Context.** Business rule 4 says a player may have only one active prediction.
-The obvious implementation in a service layer is:
-
-```ts
-const existing = await getActivePrediction(playerId);
-if (existing) throw new ConflictError();
-await insertPrediction(...);
-```
-
-That is a check-then-act sequence. Two concurrent requests can both read "no
-pending prediction" and both insert.
-
-**Decision.** Enforce the rule in the database:
-
-```sql
-create unique index predictions_one_pending_per_player
-  on predictions (player_id) where status = 'pending';
-```
-
-The service still performs the check, but only as a cheap pre-check for a
-friendly error message. The index is the guarantee. A `23505` violation on that
-specific constraint is translated into a domain error and returned as HTTP 409.
-
-**Alternative considered.** `SELECT ... FOR UPDATE` on the player row, or a
-transaction-level advisory lock per player. Both work, but both require holding
-a lock across an external HTTP call to the price provider, and both are more
-code for the same outcome.
-
-**Experiment (run before writing the application, against PostgreSQL 16.2).**
-
-```
-create unique index probe_one_pending on probe (player_id) where status = 'pending';
-
--- 20 truly parallel inserts for the same player, via Promise.all
-parallel inserts succeeded (want 1): 1
--- duplicate insert error: code 23505, constraint probe_one_pending
-```
-
-The same experiment is preserved as an automated test
-(`tests/integration/store.test.ts` → "lets exactly one of 20 concurrent
-creations win"), so the guarantee stays verified rather than merely asserted.
-
-**Trade-off.** The index is partial, so it constrains only pending rows. That is
-the intent, but it means the rule "one *active* prediction" is defined by
-`status = 'pending'` — if a future feature added a third status, this index
-would need revisiting.
-
-**Files.** `migrations/001_init.sql`, `src/server/game/store.ts`,
-`tests/integration/store.test.ts`.
-
----
+This is the reasoning trail behind the implementation. It records the problem
+each decision addresses, the alternatives considered, what the code does now and
+the trade-off that remains. The entries are ordered by decision number; D23
+supersedes the original hosting choice in D3.
 
-## D2 — Coinbase Exchange is the price provider
-
-**Context.** The assignment requires real BTC/USD prices and *fair* settlement.
-Fairness forced a requirement that was not obvious at first: we need a
-timestamp that belongs to the quote, not to our own request. Without it, the
-60-second rule and "the price has changed" would both be measured against our
-own clock, and we would have no way to tell a fresh quote from a cached one.
-
-**Decision.** `GET https://api.exchange.coinbase.com/products/BTC-USD/ticker`.
-
-**Alternatives considered, with the evidence that ruled them out:**
-
-| Provider | Verdict |
-| --- | --- |
-| Binance `BTCUSDT` | Rejected. Not a USD pair, and the live call returned `{"code":0,"msg":"Service unavailable from a restricted location..."}` — an outage that depends on where the app is deployed. |
-| Coinbase `/v2/prices/BTC-USD/spot` | Rejected. Correct pair, but the response is `{"data":{"amount":"82232.055",...}}` — **no timestamp at all**, so every timing decision would rest on our own clock. |
-| Kraken `Ticker?pair=XBTUSD` | Rejected. Response confirmed live, but again carries no quote timestamp (only trade counts and OHLC buckets). |
-| Provider aggregator (CoinGecko etc.) | Rejected. Introduces an extra hop and a second set of freshness semantics for no gain at this scale. |
-
-The chosen endpoint returns, verified against the live API during design:
-
-```json
-{"ask":"82189.17","bid":"82189.16","volume":"7152.80223161",
- "trade_id":1106664073,"price":"82190.33","size":"0.00006019",
- "time":"2026-10-15T21:28:06.113600557Z"}
-```
-
-This gives a genuine `BTC-USD` pair, a provider timestamp, a monotonic
-`trade_id`, no API key, and no region restriction.
-
-**Trade-off.** Single venue, not a cross-exchange index. A thin venue can in
-principle print a wick that a composite price would smooth out. For a 60-second
-UP/DOWN game the disagreement between venues is far below the movement the game
-is measuring, and consistency matters more than breadth: the same source is used
-for entry and settlement, which is what makes the comparison meaningful.
-
-**Files.** `src/server/prices/coinbase.ts`, `tests/unit/coinbase.test.ts`.
-
----
-
-## D3 — A long-running process with an in-process scheduler, not serverless
-
-Historical choice, superseded for public hosting by D23 on 16 October 2026.
-The timer implementation remains available for local/container deployments.
-
-**Context.** A prediction must resolve whether or not the player keeps the page
-open. A per-request check cannot guarantee that: the player may close the tab and
-never return. Something server-side has to drive resolution on a timer.
-
-**Decision.** Deploy as a long-running Node process (Docker container on a
-container host such as Railway or Render) and run the settlement sweep on a
-`setInterval` inside that process. The sweep is stateless — it discovers work by
-querying for pending predictions whose window has elapsed — so it also runs on
-boot, which is what makes restarts recover rather than lose work.
-
-**Alternatives considered:**
-
-- **Per-prediction `setTimeout` in memory.** Rejected: dies on restart or
-  redeploy, silently stranding the prediction with no way to notice.
-- **Serverless + platform cron (e.g. Vercel cron).** Viable, and the code
-  supports it: `POST /api/settle` runs the same sweep. But on free/serverless
-  tiers the minimum schedule granularity is minutes, so a 60-second game would
-  settle late by design. Documents a degraded experience rather than avoiding it.
-- **AWS EventBridge + SQS + worker.** Rejected as over-engineering for a
-  half-day exercise. It is the right answer at much higher volume (D15).
-- **Database-level scheduling (pg_cron).** Rejected: requires an extension that
-  managed Postgres tiers may not expose, and it moves business rules into SQL
-  where they are harder to test.
-
-**Trade-offs, stated plainly (these are real limitations):**
-
-1. **Suspension.** On a host that idles containers to zero, ticks do not fire
-   while suspended. Predictions settle late. Minimum-wait invariants still hold,
-   but a later quote can change the outcome. A later sweep resolves only records
-   with an eligible changed quote.
-2. **Restart.** Nothing is held in memory. Pending work lives in Postgres.
-3. **Multiple instances.** Safe but redundant: two schedulers racing is resolved
-   by the conditional settlement update (D4) — one wins, the other becomes a
-   no-op. The cost is N provider polls per tick, so
-   `SETTLEMENT_SCHEDULER_ENABLED=false` exists to disable the scheduler on all
-   but one instance.
-4. **Single point of failure.** If the process is down, nothing settles until it
-   is back.
-
-**Files.** `src/server/settlement/scheduler.ts`,
-`src/server/settlement/runner.ts`, `src/instrumentation.ts`.
-
----
-
-## D4 — Settlement is one conditional UPDATE, so it cannot score twice
-
-**Context.** Settlement has three possible callers (the scheduler, an
-opportunistic API-triggered sweep, and an external cron hitting `/api/settle`).
-Any of them can overlap. The failure mode — a player scored twice for one
-prediction — is silent and corrupts the product.
-
-**Decision.** Settling is a single statement:
-
-```sql
-with settled as (
-  update predictions
-     set status = 'resolved', outcome = $2, settlement_price = $3, ...
-   where id = $1 and status = 'pending'
-  returning player_id, outcome
-), scored as (
-  update players p
-     set score = p.score + case when s.outcome = 'win' then 1 else -1 end
-    from settled s where p.id = s.player_id
-  returning p.score
-)
-select (select count(*) from settled)::int, (select score from scored)
-```
-
-The score update is *driven by the rows the status update actually returned*.
-There is no window between "check the status" and "add a point". Both CTEs run in
-one statement, so the status change and the score change commit together or not
-at all. A loser in a race gets `settled: false`, which is a normal outcome, not
-an error.
-
-**Experiment (PostgreSQL 16.2, before implementation).**
-
-```
-update probe set status='resolved' where player_id=1 and status='pending' returning id;
-conditional update rowCounts: 1 0   -- second call matched nothing
-```
-
-Automated today: `tests/integration/store.test.ts` (repeated and ×10 concurrent
-settlement) and `tests/integration/game-loop.test.ts` (two racing sweeps).
-
-**Alternative considered.** `SELECT ... FOR UPDATE` then branch in application
-code. Correct, but it needs an explicit transaction, more round trips, and it
-puts the atomicity in the caller's hands rather than in one statement.
-
-**Trade-off.** The score is now changed by SQL rather than by TypeScript. The
-mitigation is a `CHECK` constraint that makes an inconsistent `(direction,
-entry_price, settlement_price, outcome)` row impossible (D7), so the SQL cannot
-silently produce a rule-breaking result.
-
-**Files.** `src/server/game/store.ts` (`settlePrediction`),
-`migrations/001_init.sql`.
-
----
-
-## D5 — The database clock is the clock of record for the 60-second rule
-
-**Context.** `created_at` was already going to be a database default, and the
-"no early resolution" check compares `resolved_at` against `created_at + 60
-seconds`. If the scheduler selected candidates using the *application* clock
-while the constraint validated them against the *database* clock, then clock
-drift between two machines could either make the constraint reject a legitimate
-settlement, or make the sweep sit idle on work that was actually due.
-
-**Decision.** Time-based decisions at settlement use the database clock:
-
-- `created_at` and `resolved_at` are both written by the database.
-- The sweep selects due predictions with
-  `created_at + make_interval(secs => $1) <= now()` — both sides in the database.
-- The same `now()` value is returned to the caller and used as the `now` input
-  for the settlement decision.
-
-So the app server does not need to be clock-synchronised with the database for
-the game to be fair. The one place the application clock is still used is entry
-quote freshness (`evaluateEntryQuote`), where the budget is 15 seconds and
-second-level accuracy is irrelevant.
-
-**Trade-off.** The settlement decision depends on a database round trip, and a
-pure unit test of the runner needs the database. That is why the decision
-function itself is a pure function taking `now` as an argument — the clock
-question is isolated to the store layer, and the rules remain unit-testable.
-
-**Files.** `src/server/game/store.ts` (`listSweepable`),
-`src/server/settlement/runner.ts`, `migrations/001_init.sql`.
-
----
-
-## D6 — Prices are exact decimal strings, never floats
-
-**Context.** Points are awarded by comparing two prices. IEEE-754 doubles cannot
-represent most decimal fractions exactly (`0.1 + 0.2 !== 0.3`), so comparing
-prices as `number` would be approximately correct — which is not good enough for
-something that moves a score.
-
-**Decision.** Prices are `NUMERIC(18,8)` in Postgres; `pg` returns them as
-strings; the provider's `price` string is passed through untouched; comparisons
-go through `compareDecimal`, which scales both operands to a common number of
-decimal places and compares `BigInt`s.
-
-**Finding while writing tests.** Postgres normalises `NUMERIC` to the *declared*
-scale, so a price submitted as `80000.00` reads back as `80000.00000000`. This
-is harmless for correctness (comparison normalises scale) but wrong for display,
-so `trimDecimal` normalises presentation paths. Test assertions compare prices
-with `decimalsEqual` rather than string equality, because string equality would
-be asserting an implementation detail of the column type.
-
-**Alternative considered.** Store integer cents, or a float with a rounding
-step. Integer cents would be simplest if prices were always 2 decimals, but a
-BTC price can legitimately carry more, and the game should not invent a
-precision limit. Floats were rejected outright.
-
-**Trade-off.** Slightly more ceremony than `number`, and every price crossing a
-boundary is a string, which is easy to misuse (`'9' > '10'` is `true` for
-strings). The mitigation is that comparison is only available through
-`compareDecimal` / `decimalsEqual`, and `tests/unit/decimal.test.ts` pins the
-behaviour including malformed input.
-
-**Files.** `src/domain/decimal.ts`, `migrations/001_init.sql`,
-`tests/unit/decimal.test.ts`.
-
----
-
-## D7 — Business invariants are duplicated as database CHECK constraints
-
-**Context.** The pure decision function already refuses to produce a result for
-an unchanged price, and already requires 60 seconds to have elapsed. Relying on
-that alone means one future code path — a script, a migration, a bug fix under
-time pressure — could write a rule-breaking row.
-
-**Decision.** Encode the rules the database can check:
-
-| Invariant | Enforcement |
-| --- | --- |
-| At most one pending prediction per player | Partial unique index (D1) |
-| Direction is `up` or `down` | `CHECK` |
-| Status is `pending` or `resolved` | `CHECK` |
-| Resolved rows carry full settlement data; pending rows carry none | `CHECK` (`predictions_settlement_completeness`) |
-| No resolution before 60 seconds | `CHECK` (`predictions_no_early_resolution`) |
-| Settlement quote strictly later than entry quote | `CHECK` |
-| Outcome matches the price movement | `CHECK` (`predictions_outcome_matches_price_movement`) |
-| Score is only moved once per prediction | Conditional `UPDATE` (D4) |
-
-**Finding, and a bug this caught.** The first version of the outcome constraint
-was:
-
-```sql
-(outcome = 'win') = (case direction when 'up' then settlement_price > entry_price ... end)
-```
-
-While writing the tests for it, it became clear this permits an **unchanged**
-price to be scored as a `loss`: `(outcome = 'win')` is `false` and
-`(entry_price > entry_price)` is also `false`, so the biconditional holds. The
-constraint now also requires `settlement_price <> entry_price`. The regression
-test is `tests/integration/store.test.ts` → "refuses to score an unchanged price
-as a loss". The migration had not been applied anywhere yet, which is why it
-could be corrected in place.
-
-**Trade-off.** Rules now live in two places, and they can drift. Accepted
-knowingly: the pair is exercised by the same test suite, and a drift shows up as
-a failing integration test rather than as a wrong score. The alternative — rules
-only in SQL — would make them hard to unit test; rules only in TypeScript would
-leave the database able to store impossible states.
-
-**Files.** `migrations/001_init.sql`, `tests/integration/store.test.ts`.
-
----
-
-## D8 — Refuse to guess: no quote means no prediction, no movement means no result
-
-**Context.** Several situations have no correct answer available: the provider is
-down, the quote is stale, or the price has not moved since the prediction was
-placed. Each could be resolved "helpfully" — reuse the last known price, treat
-unchanged as a loss, retry until something moves — and each of those choices
-would be inventing an outcome.
-
-**Decision.** Fail closed, and report why:
-
-- No usable quote at entry → **no prediction is created** (stale or unreliable
-  entry price would corrupt the whole round). HTTP 503 with a reason.
-- No quote, stale quote, or future-dated quote at settlement → **stay pending**.
-  The score is untouched and the prediction is retried next sweep.
-- Price unchanged → **stay pending** until a later quote actually moves. The
-  player sees "the price has not moved yet" rather than a fabricated loss.
-
-Every refusal is a named reason (`PendingReason`) surfaced through the API and
-rendered in the UI, so the state is explainable rather than a spinner.
-
-**Trade-off.** A prediction can stay open longer than a minute — indefinitely, if
-the market genuinely does not move (easier to hit with a low-precision price
-than one might expect). This is the honest reading of the rules: the assignment
-says a prediction resolves when the price has *changed*, and says unchanged
-prices must not be treated as wins or losses. The cost is a player who cannot
-play until the market ticks, which is acceptable for BTC/USD and would need
-rethinking for a thinner market.
-
-**Files.** `src/domain/rules.ts` (`decideSettlement`),
-`src/server/game/service.ts`, `tests/integration/game-loop.test.ts`.
-
----
-
-## D9 — Player identity is a server-signed cookie, not a client-supplied id
-
-**Context.** Requirement: the backend owns player identity, and a client must
-never be able to assert who it is. The frontend must not be trusted to determine
-outcomes or update scores — which also means it must not be trusted to *name*
-the player whose score it is about to read or modify.
-
-**Decision.** The server mints a random UUID on first contact, signs it with
-HMAC-SHA256 using `PLAYER_COOKIE_SECRET`, and returns it as an `HttpOnly`,
-`SameSite=Lax`, `Secure`-in-production cookie:
-
-```
-bpg_player = <uuid>.<issuedAtMs>.<base64url(hmac)>
-```
-
-Every request verifies the signature (timing-safe comparison) before the id is
-used. The API never accepts a player id from a request body, query string, or
-header.
-
-**Alternatives considered:**
-
-- **An id in `localStorage`.** Rejected: fully client-controlled, and trivially
-  forged by editing devtools — a player could read or spend another player's
-  prediction.
-- **Accepting an id from the request body.** Rejected: same problem, and it is
-  exactly the "client-supplied player id" the requirements forbid trusting.
-- **A server-side session table.** Rejected as unnecessary: the signed cookie
-  gives the same integrity without an extra table and an extra lookup per
-  request. It would be needed if we wanted server-side revocation.
-- **Real authentication.** Out of scope for the assignment, and it would change
-  the product (anonymous play is a feature here).
-
-**Limitation, stated honestly.** This is integrity, not authentication. A player
-who clears their cookie gets a new identity and starts from zero, and nothing
-stops somebody from creating many identities. The signature prevents
-impersonating a *specific existing* player; it does not prevent playing
-anonymously as a new one. Closing that would require a real account system,
-which is outside the assignment's scope.
-
-**Files.** `src/server/identity.ts`, `tests/unit/identity.test.ts`.
-
----
-
-## D10 — Simulated prices cannot reach production by accident
-
-**Context.** The development environment used for this project has no outbound
-access to market data APIs (verified: Coinbase, Kraken, Binance and CoinGecko all
-failed to connect). To run and demonstrate the application anyway, a simulated
-provider is needed. That is a genuine deployment risk: a demo mode that silently
-serves fake prices to real players would make the game meaningless.
-
-**Decision.** Three independent guards:
-
-1. `loadConfig` throws if `PRICE_PROVIDER=simulated` while
-   `NODE_ENV=production`, unless `ALLOW_SIMULATED_PRICES=true` is deliberately
-   set.
-2. The provider reports `simulated: true`, and the API includes that flag in its
-   responses so the UI can show a visible "simulated prices" marker.
-3. Real prices are the default: the provider selection is opt-in and
-   `coinbase` is used when nothing is configured.
-
-Tested in `tests/unit/config.test.ts` (production + simulated is refused; the
-explicit opt-in is honoured).
-
-**Trade-off.** Simulated mode exists in the shipped codebase at all. The
-alternative — keeping it out of `src/` entirely — would have made the deployed
-demo unverifiable. The guards and the visible label are the mitigation, and the
-scope is documented in README "Known limitations".
-
-**Files.** `src/server/prices/simulated.ts`, `src/server/config.ts`,
-`tests/unit/config.test.ts`.
-
----
-
-## D11 — One quote per sweep, shared by every prediction in that sweep
-
-**Context.** The sweep can find several predictions that came due in the same
-tick. Fetching a fresh quote per prediction is the obvious implementation, and it
-means two players who reached their deadline milliseconds apart could be scored
-against different prices.
-
-**Decision.** Fetch one quote per sweep and use it for the whole batch. The
-sweep becomes a single, consistent observation of the market, and the provider
-timestamp recorded on each row keeps it auditable.
-
-**Trade-off.** Each batch shares a market observation, but trigger cadence,
-provider availability and backlog determine how late that observation is.
-The original container used a five-second tick, not a guaranteed maximum delay.
-D23 supersedes that cadence for public hosting: active state requests or a
-15-minute external cron trigger sweeps. A delayed quote can change outcomes.
-At higher volume, batching and backlog need measurement before claiming any
-latency bound.
-
-**Files.** `src/server/settlement/runner.ts`.
-
----
-
-## D12 — Settlement quote must be strictly newer, checked by timestamp and trade id
-
-**Context.** "The settlement price must be genuinely later than the entry
-price" is not the same as "we fetched it later". A provider (or a cache in front
-of it) can serve a payload that is older than the entry quote while our request
-was made later.
-
-**Decision.** Two guards in `decideSettlement`: the settlement quote's timestamp
-must be strictly greater than the entry quote's, and — when both quotes carry a
-`trade_id` — the settlement trade id must be strictly greater too.
-
-**Finding: the timestamp guard is unreachable with the current constants.** A
-settlement quote must be within `settlementQuoteMaxAgeMs` (30s) of `now`, while
-the deadline is 60s after creation and the entry quote is at most a few seconds
-after creation. Therefore any quote that passes the freshness check is
-necessarily newer than the entry quote, and the timestamp branch cannot fire in
-production. This surfaced as a failing test whose assertion was wrong, not as a
-bug in the code.
-
-It is kept as defence in depth (the function must stay safe for inconsistent
-input, and the constants may be retuned), and it is tested as a pure-function
-contract with deliberately inconsistent input, with a comment in the test
-explaining the reachability analysis. The **trade-id guard is reachable**, and it
-was in fact the cause of a fixture bug during development: the test stub shared a
-default trade id with the backdated entry fixture, and settlement correctly
-refused to proceed. That is recorded in the helper's comment because it is a
-useful demonstration that the guard is not decorative.
-
-**Files.** `src/domain/rules.ts`, `tests/unit/rules.test.ts`,
-`tests/helpers/stubPriceProvider.ts`.
-
----
-
-## D13 — Raw SQL in one module, no ORM
-
-**Context.** The invariants that matter here (partial unique index, conditional
-update, `CHECK` constraints, `NUMERIC` scale) are database features. Whatever
-sits in front of them must not obscure them.
-
-**Decision.** `src/server/game/store.ts` holds every query in the project,
-hand-written, with `pg` and a small manual row mapper. No ORM, no query builder.
-
-**Alternatives considered.** Prisma or Drizzle would generate migrations and
-types, and would be the pragmatic choice for a larger schema. Here the entire
-persistence surface is two tables and seven queries, and the most important
-query is one the ORM would have made *harder* to express and to read (a
-data-modifying CTE that updates two tables).
-
-**Trade-off.** Row mapping is manual: `NUMERIC` and `BIGINT` arrive as strings
-and must be converted deliberately (`entryTradeId`, `settlementPrice`). Rows are
-mapped in exactly one place, and the integration tests exercise every query
-against real Postgres, so a mapping mistake fails loudly rather than silently.
-
-**Files.** `src/server/game/store.ts`.
-
----
-
-## D14 — Score is stored on the player and auditable from the prediction rows
-
-**Context.** Scores must persist. Storing a single `score` integer is the
-simplest thing that works, but it is also opaque: if a score looks wrong, there
-is nothing to compare it against.
-
-**Decision.** Store `players.score` as the fast path, *and* keep every resolved
-prediction with its entry price, settlement price, outcome and timestamps. A
-player's score must always equal `count(win) - count(loss)` over their resolved
-predictions, which makes the value reconstructable and every point explainable
-after the fact. The prediction rows incidentally provide the per-player history
-needed for debugging a reported dispute.
-
-**Trade-off.** Two sources of truth, which can in principle disagree. A
-reconciliation query is cheap and is noted in README "Known limitations" as an
-operational check rather than something enforced by a constraint (`CHECK`
-constraints cannot span tables; a trigger could, and would be more machinery
-than this earns).
-
-**Files.** `migrations/001_init.sql`, `src/server/game/store.ts`.
-
----
-
-## D15 — Test against a real PostgreSQL, and prioritise rules over UI
-
-**Context.** The guarantees under test are database behaviour. A fake or
-in-memory database would let the suite pass while the real constraints were
-missing or wrong — the tests would be describing an intention rather than a
-behaviour.
-
-**Decision.** Integration tests run against a real PostgreSQL instance (16.2 in
-this environment) and manipulate time by backdating `created_at` rather than by
-sleeping, so the 60-second boundary is tested exactly rather than
-approximately. Unit tests stay pure (no database) and cover the decision
-function exhaustively with a controllable clock.
-
-**Trade-off.** The test suite requires a database to be running, which is a
-setup burden for a reviewer. Handled with an explicit, loud failure and
-instructions in README ("Running tests") — and deliberately *not* with a
-"skip if no database" escape hatch, because a silently skipped test is worse
-than a failing one.
-
-**Files.** `tests/global-setup.ts`, `tests/helpers/db.ts`, `vitest.config.ts`.
-
----
-
-## D16 — Route handlers are plain `Request → Response` functions
-
-**Context.** The API could have been written as Next.js route handlers that use
-`next/headers` for cookies, or as functions that take a `Request`. The former is
-more idiomatic; the latter is testable without a framework context.
-
-**Decision.** All handler logic lives in `src/server/http/handlers.ts` as
-`handleState(request: Request): Promise<Response>` and friends. The files under
-`src/app/api/**/route.ts` are deliberately two lines: import the runtime, delegate.
-Cookies are read from the `Cookie` header and written with `Set-Cookie`, rather
-than through `next/headers`.
-
-**Reason.** The properties worth testing here are HTTP semantics — status codes,
-`Set-Cookie` attributes, error bodies — and testing them should not require
-booting a server or standing inside a framework's async request context. As a
-side effect, the handlers have no Next.js import at all, so the same code is
-portable and the framework is confined to the wrapper files.
-
-**Alternative considered.** Using `next/headers` to read and set cookies. It is
-shorter and gives framework-managed cookie merging, but it makes the tests depend
-on framework internals, and there is exactly one cookie in this application.
-
-**Trade-off.** The `Set-Cookie` header is serialised by hand
-(`serializePlayerCookie`), so the security-relevant attributes are our
-responsibility. That is arguably an advantage for review — `HttpOnly`,
-`SameSite` and `Secure` are explicit in the code — but it does mean a cookie
-library is not doing the escaping. `tests/unit/identity.test.ts` pins the output.
-
-**Files.** `src/server/http/handlers.ts`, `src/app/api/**/route.ts`,
-`src/server/identity.ts`.
-
----
-
-## D17 — The displayed price is cached; entry and settlement prices never are
-
-**Context.** The browser polls the game state every few seconds, and each poll
-wants a price. Without a cache, N players polling every 3 seconds is N/3 upstream
-requests per second, which reaches exchange rate limits long before anything else
-in this system breaks.
-
-**Decision.** `createCachedPriceProvider` wraps the live provider with a 2-second
-TTL, and is injected **only** as `displayProvider` in the HTTP runtime. Entry
-prices (`service.submitPrediction`) and settlement prices
-(`runSettlementSweep` → `settlementProvider`) always call the live provider.
-
-**Reason.** A price that decides points must never come from a cache, and a price
-that is merely rendered may. Making that a distinct, named dependency — two
-provider references in `HandlerDeps` rather than one plus a `useCache` flag —
-means authority is visible in the wiring instead of being a runtime decision.
-
-**Behaviour on failure.** A quote cached within the last 30 seconds is served
-through a momentary provider outage, so a blip does not blank the UI. Beyond
-that the error propagates, because presenting a minutes-old price as "the latest
-price" would mislead. Both bounds are configurable and tested.
-
-**Trade-off.** The displayed price can be up to 2 seconds old, so it may differ
-very slightly from the price a player receives on entry. The recorded entry price
-is shown back to them immediately after the prediction is created, and the game
-compares prices exactly rather than approximately, so this is cosmetic.
-
-**Files.** `src/server/prices/cached.ts`, `src/server/http/runtime.ts`,
-`tests/unit/cachedProvider.test.ts`.
-
----
-
-## D18 — Cookie `SameSite` is configurable, because iframes break `Lax`
-
-**Context.** The development preview for this project serves the app proxied
-under another site, and embedded in an iframe. A `SameSite=Lax` cookie is treated
-as third-party in that context and can be dropped — which would silently break
-player identity, and would look like a game bug rather than a cookie bug.
-
-**Decision.** `COOKIE_SAME_SITE` selects `Lax` (default), `Strict` or `None`, and
-config validation refuses `None` without `Secure`, because browsers reject
-`SameSite=None` cookies that are not `Secure` — a configuration that would appear
-to succeed and then fail in the browser.
-
-**Alternative considered.** Hard-coding `SameSite=Lax`. It is the better default
-and correct for a normal top-level deployment, which is why it stays the default,
-but it makes an embedded preview untestable for a reason that has nothing to do
-with the game.
-
-**Trade-off.** One more configuration knob, and a reader has to know when `None`
-is appropriate. The validation error message states the rule, and README lists the
-variable with its rationale.
-
-**Files.** `src/server/config.ts`, `src/server/identity.ts`,
-`tests/unit/config.test.ts`.
-
----
-
-## D19 — Run the standalone build, and verify that artifact
-
-**Context.** `next.config.ts` sets `output: 'standalone'` for a slim container.
-`next start` warns that it "does not work with `output: 'standalone'`", which is a
-misleading message — it does work, but it is not the supported path, and the
-standalone server is not runnable immediately after `next build` because static
-assets are not copied into the bundle.
-
-**Decision.** `scripts/prepare-standalone.mjs` completes the build (copies
-`.next/static`, `public/`, the migration runner and `migrations/`), exposed as
-`npm run standalone:prepare`. The running application in this environment — the
-one used for all production-mode verification — is
-`node .next/standalone/server.js`, which is also `CMD` in the Dockerfile.
-
-**Reason.** I want to verify the artifact that actually ships. Running `next start`
-for the preview while the Dockerfile ran a different command would mean the
-deployment path was never exercised.
-
-**Trade-off.** `npm run build` alone is no longer sufficient to produce a runnable
-bundle; `standalone:prepare` must follow. That is stated in AGENTS.md, the
-Dockerfile and the README, and the script fails loudly with instructions if
-`.next/standalone` is missing.
-
-**Not verified.** `docker build` itself could not be run in the development
-environment (no Docker daemon). The command the image runs was verified directly;
-the image build is not. That distinction is stated in the Dockerfile header and in
-the README.
-
-**Files.** `scripts/prepare-standalone.mjs`, `Dockerfile`, `package.json`.
-
----
-
-## D20 — Bug found by the smoke test: `secondsRemaining` reported 61
-
-**Context.** The first end-to-end run against the real server failed one check:
-immediately after creating a prediction, the API reported
-`secondsRemaining: 61` for a rule whose window is 60 seconds.
-
-**Cause.** The deadline is `createdAt + 60s`, where `createdAt` is the
-*database's* clock read during the insert, while the `now` used for the response
-is read by the handler *before* the insert. The difference is at least the insert
-latency, so `ceil()` on a value marginally over 60 rounds up to 61. It was the
-first thing the end-to-end test caught that every unit test had missed, because
-the unit tests supplied `now` and `createdAt` consistently.
-
-**Decision.** Clamp to `RULES.minWaitMs / 1000` with a comment explaining why the
-clamp is correct rather than cosmetic: `createdAt` is necessarily at or after the
-moment the prediction was requested, so the remaining time cannot exceed the
-configured window.
-
-**Alternative considered.** Using `Math.floor` instead of `ceil`. It fixes the 61
-but makes the countdown reach 0 up to a second before the prediction is actually
-eligible, which is its own small lie, and it would break again with a different
-rounding. Clamping is exact and expresses the invariant.
-
-**Trade-off.** A pathological clock difference (app clock far behind the database)
-would be masked instead of surfaced. Bounded and acceptable: the clamp only caps
-the *displayed* countdown, and settlement eligibility is decided from the database
-clock, never from this value.
-
-**Files.** `src/server/http/view.ts`, `tests/unit/view.test.ts`.
-
----
-
-## D21 — The HTTP contract lives in a types-only module
-
-**Context.** The browser needs the shape of the API responses, but importing the
-server's view module from a client component would risk pulling server code —
-and therefore `pg` — into the client bundle.
-
-**Decision.** `src/shared/api.ts` contains only interfaces: no imports, no runtime
-code. The server's `view.ts` imports from it and re-exports; the client imports
-from it directly.
-
-**Reason.** A single source of truth for the contract (a change to a field name
-breaks the type check on both sides) with zero risk of a server module crossing
-into the browser bundle.
-
-**Verification.** After the production build, the client chunks were grepped for
-`DATABASE_URL`, `PLAYER_COOKIE_SECRET`, `postgresql://`, `entry_trade_id`,
-`SETTLEMENT_SECRET` and `bpg_player`: zero occurrences in any chunk. There are no
-`NEXT_PUBLIC_*` variables in the project.
-
-**Trade-off.** DTO types are hand-written rather than generated from the server
-types, so a field can be added to a record without appearing in the contract —
-which is arguably the point, since the contract should be deliberate.
-
-**Files.** `src/shared/api.ts`, `src/server/http/view.ts`, `src/app/Game.tsx`.
-
----
-
-## D22 — Request bodies are bounded, because review found a 2 MB prediction
-
-**Context.** Running adversarial checks against the deployed build, a 2 MB JSON
-body sent to `POST /api/predictions` was accepted with `201 Created`. Next.js
-route handlers do not impose the 1 MB limit that the older Pages API routes had,
-and the handler called `request.json()`, which buffers the entire payload before
-any rule inspects it.
-
-**Decision.** Reject oversized bodies in two places:
-
-1. The declared `Content-Length` is checked **before reading**, so an honest
-   client's large upload is refused without being buffered.
-2. The actual body length is checked after reading, so a request that omits
-   `Content-Length` is still bounded.
-
-The ceiling is 1 KB, which is generous for `{"direction":"up"}`.
-
-**Finding while writing the test.** The first version of this check only looked
-at `Content-Length`, and the test failed — because an in-process `Request` built
-by the test harness does not set that header, and neither does a chunked upload.
-That failure was useful: it exposed that the single-check version would have been
-bypassed in exactly the case it was meant to cover. Hence the second check.
-
-**Honest limitation.** The post-read check bounds what gets *parsed and
-processed*, not what gets buffered. A hard memory bound for chunked uploads
-belongs at the platform proxy, which is where a real deployment enforces it. This
-is stated in the code comment rather than left implied.
-
-**Trade-off.** Two checks instead of one, and a magic number that has to be
-updated if the request shape ever grows. Acceptable: the payload is a single
-enum, and correctness here is cheap.
-
-**Files.** `src/server/http/handlers.ts`, `tests/integration/http.test.ts`.
-
----
-
-## Open questions / not yet decisions
-
-- **Vertical scaling.** At ~10,000 players the per-tick sweep would need
-  chunking by player id, and the settlement decision would likely move to a
-  queue-driven worker. Not implemented; described in WALKTHROUGH.md "next
-  iteration".
-- **Rate limiting.** There is currently no rate limit on `POST /api/predictions`.
-  The partial unique index bounds the *damage* (a player can have at most one
-  pending prediction, so they cannot farm predictions), and request bodies are
-  now bounded (D22), but request *volume* is unbounded. See README
-  "Known limitations".
-- **Reconciliation job.** A scheduled check that `players.score` still equals
-  the resolved-prediction tally. Not implemented.
-- **Browser-level UI verification.** The UI's states were verified by serving the
-  production build, checking the rendered HTML and assets, and exercising every
-  endpoint it calls over HTTP (including cookie handling and the full loop). No
-  browser engine was driven in the development environment, so interactions like
-  focus management and hydration warnings have not been observed directly. A
-  jsdom or Playwright component test is the obvious next step.
-- **Docker image.** The command the image runs is verified; `docker build` is not
-  (no Docker daemon available). See D19.
+## D1 — Let PostgreSQL enforce one pending prediction per player
+
+A service-level “check, then insert” looks sufficient until two requests arrive
+together. Both can observe no pending row and both can insert.
+
+The schema uses a partial unique index on `player_id` where `status = 'pending'`.
+The service still checks first because it avoids an unnecessary Coinbase call
+and gives a clearer response, but the index is the concurrency guarantee. The
+store translates that specific `23505` violation into a `409` response.
+
+The integration suite sends 20 concurrent creation attempts and expects exactly
+one success. This keeps the important claim tied to real PostgreSQL behaviour.
+
+## D2 — Use Coinbase Exchange for BTC/USD quotes
+
+The game needs more than a price. It needs a timestamp belonging to the quote so
+entry and settlement can be ordered without pretending the HTTP response time is
+the market time.
+
+The provider comparison ruled out Coinbase's simpler spot endpoint and Kraken's
+ticker because neither response included a usable provider timestamp. Binance
+offered BTC/USDT rather than BTC/USD and returned a region-dependent availability
+error during the recorded check. Coinbase Exchange's
+`/products/BTC-USD/ticker` supplies a BTC/USD price, `time` and `trade_id`
+without requiring an API key.
+
+This still uses one venue, not a cross-exchange reference price. That is enough
+for the assignment but would need a product decision in a wider release.
+
+## D3 — Keep settlement stateless; choose the trigger per host
+
+The first deployment plan used a long-running container and an in-process
+five-second timer. The useful part of that design was not the timer itself: it
+was the stateless sweep that rediscovers pending work from PostgreSQL after a
+restart.
+
+The container scheduler remains available for local or container hosting. The
+public Vercel deployment disables it because a serverless function cannot own a
+dependable interval. D23 describes the request and cron triggers used instead.
+
+Per-prediction timers were rejected because they disappear on restart and leave
+no durable record of the work they were meant to perform.
+
+## D4 — Resolve the prediction and change the score in one statement
+
+Settlement is a data-modifying CTE in `src/server/game/store.ts`. The first CTE
+updates the prediction only while it is still `pending`; the second changes the
+score only from the row returned by the first.
+
+That shape closes the gap between “mark resolved” and “change score.” A duplicate
+or racing call updates zero rows and becomes a normal no-op. Tests cover repeated
+settlement, 10 concurrent attempts, racing sweeps and overlap between a state
+request and the authenticated cron endpoint.
+
+A multi-statement transaction with explicit row locking could also work, but the
+single statement makes the dependency between the two updates harder to break.
+
+## D5 — Use the database clock for the 60-second rule
+
+PostgreSQL writes `created_at`, selects due rows with `now()` and enforces the
+minimum wait in a `CHECK` constraint. The sweep returns the same database time to
+the pure decision function.
+
+Using an application clock for one of those steps would introduce avoidable
+clock-drift disagreements between Vercel and Neon. The browser countdown is only
+presentation and has no authority.
+
+## D6 — Keep prices as exact decimal strings
+
+Coinbase sends the price as a string. The provider keeps that string intact,
+PostgreSQL stores it as `NUMERIC(18,8)`, and the domain compares normalised
+decimal strings with `compareDecimal`.
+
+Converting to JavaScript `number` would introduce binary floating-point into the
+decision that awards points. Formatting for display happens separately.
+
+## D7 — Repeat critical rules as database constraints
+
+The TypeScript policy gives useful pending reasons and is easy to test. The
+database constraints protect stored state even if a future caller bypasses part
+of the service layer.
+
+The schema checks that resolved rows are complete, resolution is at least 60
+seconds after creation, the settlement quote follows the entry quote, the price
+changed, and the outcome matches direction and movement.
+
+Constraint testing found a real mistake in the first outcome expression: an
+unchanged price could have been stored as a loss. The final constraint includes
+`settlement_price <> entry_price`, and the integration suite tries to insert
+contradictory rows directly.
+
+## D8 — Leave uncertain rounds pending
+
+Entry is refused when there is no usable quote. During settlement, an unavailable,
+stale, future-dated, replayed or unchanged quote leaves the prediction pending.
+
+The alternative was to reuse a displayed or cached value, or convert equality
+into a loss. Both would create a result the server could not defend. A delayed
+round is visible and can be retried; an invented score is much harder to detect.
+
+The flat-market consequence is explicit: a prediction can stay open
+indefinitely until a later eligible quote moves.
+
+## D9 — Use a signed anonymous cookie for player identity
+
+The server creates a random UUID and signs the player ID and issue time with
+HMAC-SHA256. The cookie is `HttpOnly`, and production cookies are `Secure`.
+Malformed, expired, future-dated or incorrectly signed tokens are ignored.
+
+This prevents a browser from choosing another known player ID. It is not
+authentication: clearing the cookie creates a new player, and scores are not a
+competitive identity system. Accounts were outside the assignment scope.
+
+## D10 — Make simulated prices visibly development-only
+
+The simulated provider makes local and controlled testing possible. It has a
+different source name, the UI displays a demo banner, and production rejects
+`PRICE_PROVIDER=simulated` unless `ALLOW_SIMULATED_PRICES=true` is set
+explicitly.
+
+The public deployment uses Coinbase and reports `simulated: false` through the
+health endpoint.
+
+## D11 — Share one quote across a settlement sweep
+
+A sweep fetches one current quote and applies that observation to every due row
+in its bounded batch. Fetching once per prediction would let players due in the
+same sweep be compared against different moments and would multiply provider
+traffic.
+
+This choice makes the batch coherent, but trigger cadence and backlog still
+affect when that observation occurs. The public deployment does not promise a
+price captured at exactly second 60.
+
+## D12 — Require settlement data to be later than entry data
+
+A later HTTP request does not prove a later market quote. The settlement policy
+requires the provider timestamp to be strictly later than the entry timestamp.
+When both quotes include trade IDs, the settlement trade ID must also be larger.
+
+Freshness limits make part of the timestamp guard defensive under today's
+constants, but keeping the ordering rule explicit protects future changes and
+catches replayed provider data.
+
+## D13 — Keep handwritten SQL in one module
+
+All game SQL lives in `src/server/game/store.ts`. The service and rule layers use
+typed objects and do not know query details.
+
+An ORM would reduce some row-mapping work, but it would obscure the most
+important query: the conditional settlement CTE. For this project, a small SQL
+surface is easier to inspect than an additional abstraction.
+
+## D14 — Store the score and keep predictions as its audit trail
+
+`players.score` makes the main state read cheap. Resolved prediction rows still
+contain enough information to recompute `count(wins) - count(losses)`.
+
+PostgreSQL cannot express that cross-table equality as a simple `CHECK`. A
+larger system should run reconciliation and alert on a mismatch. A trigger was
+not added because the existing settlement statement already owns both updates.
+
+## D15 — Test database behaviour against real PostgreSQL
+
+Unit tests cover pure rules, decimal handling, identity and provider parsing.
+Integration tests use PostgreSQL because mocks cannot prove partial indexes,
+constraints, row contention or the data-modifying CTE.
+
+The final deployment pass recorded 170 passing tests across 10 files. The suite
+fails when its test database is unavailable rather than quietly skipping the
+checks that matter most.
+
+## D16 — Keep route handlers as plain Request/Response functions
+
+The files under `src/app/api/**/route.ts` only delegate to handlers created in
+`src/server/http/handlers.ts`. Those handlers accept a standard `Request` and
+return a standard `Response`.
+
+This keeps Next.js details at the edge and lets HTTP tests cover cookies, status
+codes, headers and JSON without booting the framework. Business rules remain in
+the domain and service layers.
+
+## D17 — Cache display prices, not authoritative prices
+
+The price shown in the UI uses a short two-second cache to reduce repeated
+Coinbase calls during polling. Prediction entry and settlement always use the
+uncached provider.
+
+That separation matters because the displayed price is informational. Reusing
+it for scoring would quietly promote a UI optimisation into game authority.
+
+## D18 — Keep SameSite configurable
+
+`SameSite=Lax` is the default for a normal top-level deployment. Some preview or
+embedded environments treat that cookie as third-party, so `COOKIE_SAME_SITE`
+can be changed to `None`; production then requires `Secure`.
+
+The option exists for deployment compatibility, not because the current public
+game needs cross-site cookies.
+
+## D19 — Verify the artifact that is actually run
+
+The container path uses Next.js standalone output. `scripts/prepare-standalone.mjs`
+copies the required static files, public assets and migration files into the
+standalone directory before `node .next/standalone/server.js` starts.
+
+The standalone server command and HTTP smoke journey were verified locally. A
+Docker image build was not recorded because no Docker daemon was available in
+that environment. The public deployment now uses Vercel rather than this
+container path.
+
+## D20 — Clamp the countdown to the server-owned deadline
+
+The HTTP smoke test exposed `secondsRemaining: 61` immediately after creation.
+The handler's time was captured just before PostgreSQL assigned `created_at`, so
+the database timestamp could be slightly later.
+
+The view now clamps the countdown to the configured 60-second maximum. This is a
+display fix only; eligibility continues to use database time.
+
+## D21 — Keep the browser contract in a types-only module
+
+`src/shared/api.ts` contains the response shapes used by both the UI and server.
+It has no runtime imports, secrets, providers or database code.
+
+This lets TypeScript check the contract without making it easy to pull server
+modules into the client bundle. The production client chunks were also checked
+for database URLs, cookie names and settlement secrets, with no matches.
+
+## D22 — Bound prediction request bodies
+
+An adversarial HTTP check found that a 2 MB JSON body was accepted even though a
+valid request is about 20 bytes. Next.js route handlers did not impose the
+expected default limit.
+
+The handler now rejects a declared body over 1 KB before reading it and also
+checks the actual string length for requests without `Content-Length`. The second
+check limits parsing and processing, not proxy-level buffering; a hard streaming
+limit belongs at the hosting edge.
+
+The recorded retest returned `413 payload_too_large` for 2 MB and still accepted
+a normal request.
+
+## D23 — Deploy on free serverless hosting
+
+The goal was a public take-home project with real Coinbase prices and no hosting
+cost. The selected setup is Vercel Hobby, Neon Free and cron-job.org Free.
+
+On Vercel, `GET /api/state` awaits a bounded settlement sweep before returning
+state. This gives an active player a result soon after the minimum wait. A
+secret-protected `POST /api/settle` runs every 15 minutes as the idle fallback.
+The in-process scheduler is forced off when `VERCEL=1`. Both triggers call
+`runSettlementSweep`, and D4 makes overlap safe.
+
+The trade-off is timing: an idle round can use a much later quote, and that can
+change the outcome. The game guarantees “not before 60 seconds,” not “the market
+price at exactly 60 seconds.” A permanent worker or historical market feed would
+support tighter semantics, but would add cost or infrastructure beyond this
+exercise.
+
+The deployment was checked on 16 October 2026:
+
+- Vercel reported Hobby and Neon reported Free;
+- migrations applied successfully and health reported the database up;
+- Coinbase reported `simulated: false`;
+- a request-triggered production round settled after the threshold and repeated
+  reads left its score unchanged;
+- a separate prediction received no state request after creation, then a cron
+  POST returned 200 at `10:45:16.680Z` and PostgreSQL resolved it at
+  `10:45:17.129Z` using a quote timestamped `10:45:16.226Z`;
+- the local verification pass completed typecheck, lint, the production build
+  and all 170 tests.
+
+## D24 — Coalesce overlapping sweeps inside one server instance
+
+Review entry: 16 October 2026.
+
+The database already makes concurrent settlement safe, but correctness did not
+make duplicate work free. Before this review, a state poll and cron request that
+overlapped in the same warm Vercel instance each selected candidates and each
+called Coinbase. At higher traffic that amplifies provider requests and creates
+avoidable database contention.
+
+`createHandlers` now keeps one in-flight sweep promise and lets overlapping
+requests await it. This is deliberately process-local: it reduces duplicate
+work without adding a lock service or holding a database transaction open
+across a network call. Separate Vercel instances may still race, so the atomic
+settlement statement remains the correctness boundary.
+
+The HTTP integration tests cover both cases. One handler graph makes one
+provider call for overlapping state and cron requests; two independent handler
+graphs still race and change the score exactly once.
+
+## D25 — Treat anonymous identity failures as recoverable input
+
+Review entry: 16 October 2026.
+
+The player cookie is untrusted input. A percent-encoded value that could not be
+decoded previously threw before signature verification and turned a normal
+state request into a 500. `readCookie` now treats that value as absent, which
+uses the existing safe behaviour: issue a new signed identity.
+
+A related edge case appeared when a first-time player submitted a valid
+direction while Coinbase was unavailable. The service had already created the
+player row, but the `503` response did not include the newly minted cookie. A
+retry therefore created another anonymous player. Error responses after
+identity resolution now preserve that cookie. The round still is not created
+without a trustworthy price.
+
+## D26 — Poll according to what the player can observe
+
+Review entry: 16 October 2026.
+
+Polling every three seconds is useful while a round is approaching settlement,
+but it was also running for idle players and hidden tabs. Ten thousand idle
+tabs would produce roughly 3,333 state requests per second before doing useful
+work.
+
+Active rounds still poll every three seconds. Idle screens poll every ten
+seconds, hidden tabs make no polling request, and returning to the tab triggers
+an immediate refresh. This does not solve large-scale rate limiting, but it
+removes obvious background traffic without changing the API or the active game
+experience.
+
+## D27 — Recover explicitly from concurrent insert conflicts
+
+Review follow-up: 16 October 2026.
+
+The partial unique index already prevented two pending predictions, but the
+losing request surfaced the store's `ActivePredictionExistsError` as HTTP 500.
+The service now reloads the winning row and translates that known conflict to
+the existing `PredictionAlreadyActiveError`, so the HTTP layer returns 409 with
+authoritative state. A barrier-controlled HTTP test forces both requests past
+the pre-check before either insert runs.
+
+Player creation had a subtler PostgreSQL edge case. The single-statement
+`INSERT ... ON CONFLICT DO NOTHING` CTE can observe another transaction's
+conflict while its original statement snapshot still cannot see the row that
+caused it. If the CTE returns no row, `ensurePlayer` now performs one separate
+`SELECT`, which gets a fresh Read Committed snapshot. I rejected `ON CONFLICT DO
+UPDATE ... RETURNING`: it would return the row in one statement, but would also
+turn every polling read for an existing player into an unnecessary write.
+
+The regression test holds the first insert open, confirms through
+`pg_blocking_pids` that the second connection is waiting for it, commits the
+first transaction and verifies that the fallback returns the player. This
+covers the actual transaction ordering rather than hoping concurrent promises
+happen to reproduce it.
+
+## Open questions
+
+These need product or scale evidence before code changes:
+
+- Should a flat market eventually become a draw or no-result outcome?
+- Does the product want the first observed quote after 60 seconds, or a
+  historical price tied to the exact deadline?
+- At what traffic level does settlement move to a dedicated worker?
+- When do anonymous scores need real accounts?
+- What rate limits are appropriate for prediction creation?
+- Should a reconciliation job compare stored scores with resolved predictions?

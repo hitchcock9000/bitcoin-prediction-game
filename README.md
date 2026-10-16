@@ -37,10 +37,12 @@ tour of the implementation, see [WALKTHROUGH.md](WALKTHROUGH.md).
 An unavailable, stale, future-dated or unchanged quote leaves the prediction
 pending. I prefer an explicit wait to guessing a result.
 
-The UI polls `GET /api/state` every three seconds. On Vercel, that request also
-runs a bounded settlement sweep, so an active player normally sees the result
-soon after the 60-second threshold. A protected cron job calls
-`POST /api/settle` every 15 minutes as a fallback when nobody has the game open.
+The UI polls `GET /api/state` every three seconds while a prediction is active
+and every ten seconds while idle. Hidden tabs pause polling and refresh as soon
+as they become visible. On Vercel, a state request also runs a bounded
+settlement sweep, so an active player normally sees the result soon after the
+60-second threshold. A protected cron job calls `POST /api/settle` every 15
+minutes as a fallback when nobody has the game open.
 
 ## 3. How to run it locally
 
@@ -117,8 +119,9 @@ also pending because it is neither a win nor a loss under the game rules.
 
 Vercel functions cannot host a dependable in-process timer. Active play uses a
 request-triggered sweep; cron-job.org provides a 15-minute background fallback.
-Both call the same settlement function, and the database makes overlap safe.
-This keeps hosting at €0, with an honest latency trade-off for idle games.
+Both call the same settlement function. Overlapping calls in one server
+instance share the same sweep; the database still makes cross-instance races
+safe. This keeps hosting at €0, with an honest latency trade-off for idle games.
 
 ## 5. Testing
 
@@ -144,11 +147,15 @@ npm run lint
 npm run build
 ```
 
-The verified deployment pass on 16 October 2026 produced:
+The deployed version was verified on 16 October 2026 with 170 passing tests.
+The engineering-review branch produced 176 passing tests across the same 10
+files, plus typecheck, lint and a production build. Its added coverage checks
+malformed cookies, identity retention after a provider failure, overlapping
+sweeps within and across server instances, concurrent prediction conflicts and
+the PostgreSQL snapshot edge case during concurrent player creation.
 
-- 170 passing tests across 10 files;
-- typecheck and lint with no errors;
-- a successful Next.js production build;
+The deployment verification also included:
+
 - concurrent coverage for 20 prediction creations, 10 settlement attempts, and
   an overlapping state-request/cron sweep;
 - a real public round using Coinbase and a separate cron-only settlement check.
@@ -157,6 +164,9 @@ The test suite covers the pure settlement policy, Coinbase parsing, signed
 identity cookies, HTTP responses, database constraints, score persistence and
 concurrent settlement. `scripts/smoke.mjs` provides an additional full HTTP
 journey for the local/container mode.
+
+Pull requests to `main` run the same typecheck, lint, test and build checks in
+GitHub Actions against an isolated PostgreSQL 17 service.
 
 ## 6. Deployment
 
@@ -171,7 +181,8 @@ The in-process scheduler is forced off when `VERCEL=1`. Vercel uses the pooled
 Neon URL with a small connection pool; migrations use the direct URL. The cron
 endpoint requires a separate secret in the `x-settlement-secret` header.
 
-I verified the deployed system rather than relying only on provider dashboards:
+The deployment checks recorded on 16 October 2026 went beyond provider
+dashboards:
 
 - `/api/health` reported the database up and Coinbase with `simulated: false`;
 - a live prediction stayed pending before 60 seconds and then settled from a

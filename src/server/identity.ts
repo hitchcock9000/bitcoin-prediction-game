@@ -96,7 +96,14 @@ export function readCookie(cookieHeader: string | null | undefined, name: string
     const separator = part.indexOf('=');
     if (separator === -1) continue;
     if (part.slice(0, separator).trim() !== name) continue;
-    return decodeURIComponent(part.slice(separator + 1).trim());
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      // A cookie is untrusted input. Invalid percent-encoding should behave
+      // like any other malformed token: reject it and let the server issue a
+      // fresh identity instead of turning the request into a 500 response.
+      return null;
+    }
   }
   return null;
 }

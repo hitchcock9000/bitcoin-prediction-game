@@ -77,6 +77,30 @@ export interface Handlers {
 export function createHandlers(deps: HandlerDeps): Handlers {
   const now = deps.now ?? (() => new Date());
   const log = deps.log ?? (() => {});
+  let settlementInFlight: ReturnType<typeof runSettlementSweep> | null = null;
+
+  /**
+   * Share overlapping sweeps inside one warm process.
+   *
+   * Vercel can still run several instances at once, so this is an upstream
+   * load reduction rather than a correctness boundary. Cross-instance races
+   * remain safe because settlePrediction conditionally updates pending rows.
+   */
+  function runCoalescedSettlementSweep(): ReturnType<typeof runSettlementSweep> {
+    if (settlementInFlight) {
+      log('settlement_sweep_joined', {});
+      return settlementInFlight;
+    }
+
+    settlementInFlight = runSettlementSweep({
+      store: deps.store,
+      provider: deps.settlementProvider,
+      log,
+    }).finally(() => {
+      settlementInFlight = null;
+    });
+    return settlementInFlight;
+  }
 
   /**
    * Identity comes only from the signed cookie. `POST /api/predictions` reads
@@ -181,6 +205,16 @@ export function createHandlers(deps: HandlerDeps): Handlers {
     return json({ error: { code, message, ...extra } }, { status });
   }
 
+  function identifiedErrorResponse(
+    status: number,
+    code: string,
+    message: string,
+    setCookie: string | null,
+    extra: Record<string, unknown> = {},
+  ): Response {
+    return json({ error: { code, message, ...extra } }, { status, setCookie });
+  }
+
   return {
     async handleState(request: Request): Promise<Response> {
       const currentTime = now();
@@ -189,7 +223,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
         // Await work inside the request: serverless instances may stop after
         // responding. Cron invokes this same bounded, idempotent sweep.
         try {
-          await runSettlementSweep({ store: deps.store, provider: deps.settlementProvider, log });
+          await runCoalescedSettlementSweep();
         } catch (error) {
           log('request_settle_failed', { message: error instanceof Error ? error.message : String(error) });
         }
@@ -272,11 +306,22 @@ export function createHandlers(deps: HandlerDeps): Handlers {
 
         if (error instanceof PriceUnavailableError) {
           log('entry_refused', { reason: error.reason });
-          return errorResponse(503, 'price_unavailable', error.message, { reason: error.reason });
+          return identifiedErrorResponse(
+            503,
+            'price_unavailable',
+            error.message,
+            identity.setCookie,
+            { reason: error.reason },
+          );
         }
 
         log('prediction_failed', { message: error instanceof Error ? error.message : String(error) });
-        return errorResponse(500, 'internal_error', 'Could not place the prediction. Please retry.');
+        return identifiedErrorResponse(
+          500,
+          'internal_error',
+          'Could not place the prediction. Please retry.',
+          identity.setCookie,
+        );
       }
     },
 
@@ -303,11 +348,7 @@ export function createHandlers(deps: HandlerDeps): Handlers {
       }
 
       try {
-        const result = await runSettlementSweep({
-          store: deps.store,
-          provider: deps.settlementProvider,
-          log,
-        });
+        const result = await runCoalescedSettlementSweep();
         return json({
           examined: result.examined,
           settled: result.settled,
