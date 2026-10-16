@@ -1,7 +1,8 @@
 # Bitcoin prediction game — study guide
 
 This file is for interview preparation. It is intentionally separate from the
-public README.
+public README. The sample wording is a prompt, not a script: verify each claim
+in the code and use only the explanations you can reproduce yourself.
 
 ## The five decisions to understand first
 
@@ -11,7 +12,7 @@ The browser sends only `{ "direction": "up" }` or `{ "direction": "down" }`.
 The server gets the player from a signed cookie, fetches the Coinbase price and
 uses database timestamps. React renders the answer; it does not calculate one.
 
-Natural explanation:
+One natural way to explain it:
 
 > I wanted one obvious trust boundary. The browser can express intent, but it
 > cannot name a player, choose a price, move a clock or add points. That removes
@@ -24,7 +25,7 @@ player cannot open two rounds. The service checks first for a better error, but
 two requests can pass that check at the same time. The index still allows only
 one insert.
 
-Natural explanation:
+One natural way to explain it:
 
 > An application pre-check is useful for UX, but it is not a concurrency
 > guarantee. I put the invariant at the point where competing requests meet:
@@ -37,7 +38,7 @@ while its status is `pending`, then updates the player's score from the row that
 was actually changed. A competing settlement finds nothing to update and cannot
 change the score.
 
-Natural explanation:
+One natural way to explain it:
 
 > I did not want a gap between “mark this resolved” and “add a point.” One SQL
 > statement makes them commit together, and the pending condition turns retries
@@ -49,7 +50,7 @@ The settlement rule checks the 60-second floor, provider availability, quote
 freshness, future clock skew, ordering after the entry quote and actual price
 movement. Every ambiguous case returns a named pending reason.
 
-Natural explanation:
+One natural way to explain it:
 
 > A delayed result is visible and recoverable. A fabricated result is silent
 > corruption. When I cannot defend the quote, I leave the round pending.
@@ -60,7 +61,7 @@ Active players trigger a sweep through `GET /api/state`. A protected external
 cron triggers the same function every 15 minutes when there is no traffic. The
 in-process timer is disabled on Vercel but remains available for a container.
 
-Natural explanation:
+One natural way to explain it:
 
 > Vercel Hobby does not give me a permanent worker. I kept the settlement logic
 > stateless, then used requests for the normal experience and a free cron as the
@@ -119,9 +120,10 @@ The key separation is:
 
 #### `Game.load` — `src/app/Game.tsx`
 
-Calls `/api/state` every three seconds and replaces local state with the server
-response. If a refresh fails, it keeps the previous state visible and shows a
-recoverable error.
+Calls `/api/state` every three seconds during an active round and every ten
+seconds while idle. Hidden tabs pause polling and refresh on return. If a
+refresh fails, it keeps the previous state visible and shows a recoverable
+error.
 
 Why it works: the UI never tries to merge scores or derive a result. Each good
 response is a fresh authoritative snapshot.
@@ -374,7 +376,9 @@ constraint and stored response semantics.
 
 > Both may inspect the same pending row. The first conditional update changes
 > it and drives one score update. The second update no longer matches
-> `status = 'pending'`, so it changes nothing.
+> `status = 'pending'`, so it changes nothing. Inside one warm server instance,
+> overlapping requests now share one in-flight sweep first; the SQL rule still
+> matters because separate instances cannot share that memory.
 
 ### Why use the database clock?
 
@@ -401,23 +405,25 @@ constraint and stored response semantics.
 > game may wait for the 15-minute cron, and that later quote may change the
 > result.
 
-### Why not use Vercel Cron?
+### Why use an external cron?
 
-> The approved target was zero cost on Vercel Hobby, and the chosen external
-> scheduler provides the required 15-minute fallback without a paid add-on. The
-> endpoint is secret-protected and uses the same tested sweep as browser traffic.
+> The goal was to keep hosting at €0. The external scheduler provides a
+> 15-minute fallback without a paid add-on. The endpoint is secret-protected and
+> uses the same tested sweep as browser traffic.
 
 ### How do you know the cron really works?
 
-> I created a production prediction, made no state request after creation, and
-> observed it remain pending after the deadline. Vercel then logged the cron POST
-> with HTTP 200, and Neon showed the row resolved one second later.
+> The deployment record includes a production prediction with no state request
+> after creation. Vercel logged the cron POST with HTTP 200, and Neon showed the
+> row resolved one second later. The timestamps are recorded in `DECISIONS.md`.
 
 ### What would you change first at higher traffic?
 
 > I would measure pending volume and settlement latency first. Likely changes are
 > a dedicated worker, chunked or locked work claiming, rate limiting, metrics and
-> score reconciliation. I would not add them before the load justified them.
+> score reconciliation. The current branch removes two obvious sources of
+> duplicate work—same-instance sweep overlap and hidden-tab polling—but I would
+> not claim a capacity number without a load test.
 
 ### What is the weakest part of the current design?
 
@@ -494,9 +500,9 @@ direction, expiry and cleanup. Then compare it with the current 409 behaviour.
 
 ## Final interview reminder
 
-Do not try to memorise every file. Be able to defend the five decisions at the
-top, trace one creation and one settlement, and state the limits without hiding
-them. The strongest version of the story is simple: I made the browser
-untrusted, put concurrency guarantees in PostgreSQL, kept the outcome rule pure,
-made score updates atomic, and documented the timing compromise required by free
-serverless hosting.
+Do not try to memorise every file. Work towards explaining the five decisions at
+the top, tracing one creation and one settlement, and stating the limits without
+hiding them. Once you can support it from the code, the short version is: the
+browser is untrusted, concurrency guarantees live in PostgreSQL, the outcome rule
+is pure, score updates are atomic, and free serverless hosting has an explicit
+timing compromise.

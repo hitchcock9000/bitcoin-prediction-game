@@ -19,7 +19,7 @@ src/server/game/       Service boundary + ALL SQL (store.ts). Only place that
                        talks to Postgres.
 src/server/prices/     Market data adapters. `coinbase.ts` is production;
                        `simulated.ts` is dev/demo only.
-src/server/settlement/ Stateless sweep + in-process scheduler.
+src/server/settlement/ Stateless sweep + optional in-process scheduler.
 src/server/http/       Thin handlers: identity, input shape, error mapping.
                        No business rules.
 src/app/api/**/        Two-line wrappers. Keep them that way.
@@ -57,7 +57,7 @@ npm start              # run the build (next start)
 npm run typecheck      # tsc --noEmit      — must pass
 npm run lint           # eslint            — must pass with 0 warnings
 npm test               # vitest (unit + integration; needs PostgreSQL)
-npm run test:unit      # fast, no database
+npm run test:unit      # unit files; current global setup still needs PostgreSQL
 npm run ci             # typecheck + lint + tests + build
 npm run db:migrate     # apply migrations (idempotent)
 node scripts/smoke.mjs # end-to-end check against a running server (~70s)

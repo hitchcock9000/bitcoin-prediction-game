@@ -1,423 +1,285 @@
 # Engineering walkthrough
 
-## Serverless delivery update — 16 October 2026
+This is a 20-minute presentation guide, not a script to memorise. Every talking
+point maps to a current file, test or recorded deployment check. Before the
+interview, follow the code paths yourself and keep only the wording that feels
+natural.
 
-The selected hosting is Vercel Hobby, Neon Free and cron-job.org Free.
-State requests await the existing settlement sweep before reading results.
-The browser polls every three seconds, so active play normally resolves soon
-after the minimum wait. The browser never decides the outcome. A protected
-15-minute cron sweep is the fallback when no one has the game open. There is
-no in-process timer on Vercel. Both triggers use the same domain rules and
-atomic PostgreSQL statement, so overlapping executions cannot score twice.
+## Suggested timing
 
-Verified locally on 16 October: 170 tests passed against real PostgreSQL,
-including a barrier-controlled request/cron race. Typecheck, lint and production
-build passed. The production dependency audit reported zero vulnerabilities.
-
-Delayed settlement uses a later market quote and can change the outcome.
-This is a documented zero-cost trade-off, not a claim to settle at exactly
-60 seconds. The public application is deployed at
-https://bitcoin-prediction-game-khaki.vercel.app (16 October 2026), with Neon
-migrations applied and Coinbase reporting `simulated:false`. Health confirms
-the scheduler is off, request-triggered settlement is on, and an external
-secret is configured. cron-job.org execution is verified below.
-
-That cron execution was subsequently verified with production prediction
-`03177572…`: after creation at `10:42:24.692Z`, no state request occurred. The
-cron POST returned 200 at `10:45:16.680Z`, and PostgreSQL resolved the row at
-`10:45:17.129Z` using the Coinbase quote from `10:45:16.226Z` (UTC).
-
-The verified production UP round `8fb83f27…` entered at $81,935.05 at
-`10:17:46.723Z`, then lost at $81,905.00, resolved at `10:18:57.812Z` using
-the quote from `10:18:55.930Z` (all UTC, 16 October). Score became −1 and
-repeated reads left it unchanged. This proves request-triggered production
-settlement, not a closed-browser scheduled run.
-
-Notes for explaining this project to another engineer. Talking points, not a
-script. Every claim here is something I can point at in the code or in a command
-I actually ran.
-
-Suggested shape for a 20-minute session:
-
-| Time | Section |
+| Time | Topic |
 | --- | --- |
-| 2 min | [Problem and assumptions](#1-problem-and-assumptions-2-minutes) |
-| 3 min | [Live demo](#2-live-demo-3-minutes) |
-| 5 min | [Architecture and data flow](#3-architecture-and-data-flow-5-minutes) |
-| 6 min | [Three critical code paths](#4-three-critical-code-paths-6-minutes) |
-| 4 min | [Tests, trade-offs, next steps](#5-tests-trade-offs-next-steps-4-minutes) |
+| 2 min | What the game does and where the risk is |
+| 3 min | Live demo |
+| 5 min | Architecture and ownership boundaries |
+| 6 min | Three code paths worth opening |
+| 4 min | Tests, trade-offs and next steps |
 
----
+## 1. Open with the problem, not the stack
 
-## 0. Opening (60 seconds, say it naturally)
+A natural opening could be:
 
-> "It's a one-minute prediction game. You see the BTC/USD price and your score,
-> you pick higher or lower, and after at least a minute the server tells you whether you
-> were right and moves your score by one point.
+> This is a one-minute BTC/USD prediction game. The player sees a price and
+> score, chooses higher or lower, and gets one point for a correct prediction or
+> loses one for an incorrect one.
 >
-> The UI is small on purpose. Almost all the effort went into the fact that the
-> rules have to hold when things are inconvenient — you refresh, you double-click,
-> you close the tab, the price feed goes down, the market doesn't move, the
-> server restarts halfway through your round.
->
-> So the design rule I kept coming back to is: the browser asks, the server
-> decides. The browser never sends a price, never sends a player ID, never
-> computes a score, and its clock has no authority.
->
-> Concretely that's 170 tests and a schema that enforces the rules as constraints.
-> On Vercel, state requests trigger the settlement sweep. A 15-minute external
-> cron is the verified fallback when the tab is closed. Delayed settlement uses
-> a later price and can change the result."
+> The UI is intentionally small. The interesting part is keeping the rules true
+> when requests overlap, the browser refreshes, Coinbase is unavailable, or a
+> settlement trigger runs twice. The design rule is simple: the browser asks and
+> the server decides.
 
----
+Two assumptions shape the rest of the system:
 
-## 1. Problem and assumptions (2 minutes)
+- **Sixty seconds is a minimum, not an exact capture time.** The first eligible
+  sweep uses a fresh quote observed after the deadline.
+- **An unchanged price has no outcome.** It is neither higher nor lower, so the
+  prediction remains pending until a later eligible quote moves.
 
-The assignment is short, and a few things genuinely aren't specified. I wrote
-down every gap and picked an interpretation. The two that shaped the design most:
+The second rule can keep a prediction open longer than a minute. That is a
+product trade-off, not something hidden in the implementation.
 
-**"The price has changed" is a condition of resolution.** So if the price is
-exactly the same after 60 seconds, I don't score it. It stays open until a later
-quote actually moves. Treating unchanged as a loss would be inventing an outcome,
-and the rules explicitly say unchanged isn't a win or a loss. The cost: a
-prediction can stay open longer than a minute on a flat market. I think that's
-the honest reading, and it's `README.md` assumption A1.
+## 2. Live demo
 
-**We need a quote timestamp that isn't ours.** This is the one that surprised me.
-"Fair settlement" is not a feature you can bolt on at the end — it depends on
-having a market-data source that tells you *when* the price it's giving you was
-valid. I checked the obvious endpoints: Coinbase's `/v2/prices/BTC-USD/spot` and
-Kraken's ticker both return a price with **no timestamp at all**. If I'd used
-either, every timing decision would have rested on my own server clock, and I'd
-have had no way to tell a fresh quote from a cached one. Binance was out for a
-different reason — it only lists BTCUSDT, and the live call returned
-`"Service unavailable from a restricted location"`, which is an outage that
-depends on where you deploy.
+Use the public app: https://bitcoin-prediction-game-khaki.vercel.app
 
-So: Coinbase Exchange `/products/BTC-USD/ticker`, which gives me a real BTC/USD
-pair, a provider `time`, and a monotonic `trade_id`.
+1. Open the page and point out the live Coinbase source, latest price and score.
+2. Choose **Higher** or **Lower**. The response shows the server-recorded entry
+   price and starts the countdown.
+3. Explain that the countdown is presentation. It never decides eligibility.
+4. Try a second prediction in another tab or with `curl`. The database rule
+   produces `409`, and the response includes current state so the UI can recover.
+5. Wait through the threshold. Active polling calls `/api/state`, which runs the
+   settlement sweep before reading state.
+6. Refresh after resolution. The cookie identifies the same player and the score
+   comes back from PostgreSQL.
 
-Other assumptions are in the README table: whose clock decides 60 seconds (the
-database's), what happens if the feed is down (no outcome at all), how identity
-works, whether a one-cent move counts (yes).
+Useful direct checks:
 
----
+```bash
+curl -s https://bitcoin-prediction-game-khaki.vercel.app/api/health | jq .
 
-## 2. Live demo (3 minutes)
-
-The thing to show is the loop and the states, not the visuals.
-
-1. **Open the page.** Score 0, live price with its timestamp, two buttons.
-   If the deployment is running simulated prices there's a banner saying so
-   (see the demo-mode note below).
-2. **Click Higher.** The buttons disable immediately and say "Placing…". That
-   matters — the player should never be unsure whether a tap registered.
-3. **Pending state.** It shows your entry price, the entry time, a countdown, and
-   a sentence explaining what it's waiting for. The countdown is just a display:
-   it's seeded from the server's `secondsRemaining` on every poll. If I edit the
-   system clock, the result doesn't change.
-4. **Try to predict again.** Buttons are disabled. If you force a second request
-   (curl, or a second tab), you get a 409 and the UI resyncs from the state the
-   server returns in the error.
-5. **Wait.** With active polling and an eligible changed quote, the result normally
-   appears soon after 60 seconds. The score changes and the buttons return.
-   Provider failures or unchanged prices can extend the wait.
-6. **Refresh.** Score and history are still there — they were never in the client.
-7. **Optional, worth doing:** `curl` the API directly and show that the entry
-   price comes from the server, not from anything the client sent.
-
-If the deployment is running the simulated feed, say so out loud:
-*"The sandbox I built this in can't reach market data APIs, so the preview runs a
-simulated feed with a visible banner. The default is Coinbase; the banner exists
-so nobody can mistake demo prices for real ones."*
-
----
-
-## 3. Architecture and data flow (5 minutes)
-
-```
-Browser ──HTTP──► Route handlers ──► Game service ──► Domain rules (pure)
-                       │                  │                │
-                       │                  └──► Coinbase    └── (no I/O at all)
-                       │                          (entry)
-                       ▼
-                  PostgreSQL  ◄──── Settlement sweep ◄──── State request / external cron
-                  (state + constraints)   │
-                                          └──► Coinbase (settlement, one quote per sweep)
+curl -s -X POST \
+  -H 'content-type: application/json' \
+  -d '{"direction":"up"}' \
+  https://bitcoin-prediction-game-khaki.vercel.app/api/predictions | jq .
 ```
 
-**The browser** renders and asks. It has no scoring logic and no outcome logic.
-The countdown is decoration.
+The second command creates a new anonymous identity unless a cookie jar is used.
+That is useful for showing that identity comes from the server, but use a cookie
+jar when demonstrating persistence.
 
-**Route handlers** (`src/server/http/handlers.ts`) do three things: resolve
-identity from the signed cookie, check the *shape* of the input, and map domain
-errors to status codes. They're plain `Request → Response` functions so they can
-be tested without booting a server. There's no rule in them.
+## 3. Architecture and ownership
 
-**The game service** (`src/server/game/service.ts`) is the ownership boundary —
-it fetches the entry quote, refuses an unusable one, and calls the store.
+```text
+React UI
+  -> Next.js route wrappers
+  -> HTTP handlers
+  -> game service / settlement sweep
+  -> pure domain rules
+  -> PostgreSQL
 
-**The domain** (`src/domain/rules.ts`) is pure. `decideSettlement` takes an entry
-price, a candidate quote and a `now`, and returns either a concrete outcome or a
-named reason to wait. No database, no clock, no network.
-
-**Postgres** holds the state of record *and* enforces invariants independently of
-the application: one pending prediction per player, no early resolution, the
-outcome has to match the price movement.
-
-**The triggers** are state requests and the protected external cron endpoint.
-Both call the same stateless sweep, which discovers work in PostgreSQL. The
-in-process interval is disabled on Vercel and retained for local/container use.
-Pending state survives restarts, and atomic updates make overlapping sweeps safe.
-
-One place where I deviated from the obvious design: **the database clock is the
-clock of record.** `created_at` and `resolved_at` come from Postgres, the sweep
-selects due rows with `created_at + interval <= now()` in SQL, and it hands the
-same `now()` back to the decision function. If I'd compared the app clock against
-the DB clock, clock drift between two machines could make a `CHECK` constraint
-reject a legitimate settlement — or make the sweep sit idle on work that was
-already due.
-
----
-
-## 4. Three critical code paths (6 minutes)
-
-### a) Creating a prediction — where "only one active prediction" really lives
-
-`src/server/game/store.ts` → `createPrediction`, with
-`migrations/001_init.sql`:
-
-```sql
-create unique index predictions_one_pending_per_player
-  on predictions (player_id) where status = 'pending';
+Coinbase -> entry and settlement quotes
+cron-job.org -> protected settlement endpoint
 ```
 
-The service *does* check for an existing prediction first, but only to return a
-friendly error without calling the price API. That check is a race: two requests
-can both read "no pending prediction" and both insert.
+Keep the explanation focused on responsibility:
 
-The index is the guarantee. The second insert fails with a `23505` on that
-specific constraint, which becomes a `409` with the current state attached so the
-UI can recover. I verified this before writing any application code —
-20 truly-parallel inserts, exactly 1 succeeded — and it's now a test
-(`tests/integration/store.test.ts`).
+- `src/app/Game.tsx` renders server state, polls and submits a direction. It has
+  no scoring or outcome logic.
+- `src/app/api/**/route.ts` contains thin Next.js wrappers.
+- `src/server/http/handlers.ts` handles identity, input shape, HTTP errors and
+  the two settlement triggers.
+- `src/server/game/service.ts` coordinates player state and prediction entry.
+- `src/domain/rules.ts` decides whether a quote can settle a prediction.
+- `src/server/game/store.ts` owns all game SQL.
+- `migrations/001_init.sql` protects persisted invariants.
 
-### b) Settling — why double-scoring is impossible, not just unlikely
+The database clock is the clock of record. PostgreSQL writes `created_at`, uses
+`now()` to select due rows and enforces the same 60-second boundary in a
+constraint. That avoids comparing clocks from two machines.
 
-`src/server/game/store.ts` → `settlePrediction`:
+On Vercel there is no interval running in the background. An active player's
+state request awaits a bounded sweep. cron-job.org calls the same sweep every 15
+minutes when there is no traffic. The optional in-process scheduler remains for
+local or container hosting.
+
+## 4. Three code paths to open
+
+### Creating a prediction
+
+Open `submitPrediction` in `src/server/game/service.ts`, then
+`createPrediction` in `src/server/game/store.ts` and the partial unique index in
+`migrations/001_init.sql`.
+
+The flow is:
+
+1. resolve the signed player cookie;
+2. perform a friendly active-prediction pre-check;
+3. fetch a live Coinbase quote on the server;
+4. reject stale or future-dated entry data;
+5. insert the prediction with a database timestamp;
+6. let the partial unique index stop a racing second insert.
+
+The point to defend is why both checks exist. The pre-check improves the response
+and avoids a provider call. It cannot prevent a race. The index can.
+
+The integration test in `tests/integration/store.test.ts` sends 20 concurrent
+creation attempts and expects one row.
+
+### Settling without double-scoring
+
+Open `settlePrediction` in `src/server/game/store.ts`.
 
 ```sql
 with settled as (
   update predictions
-     set status = 'resolved', outcome = $2, settlement_price = $3, ...
+     set status = 'resolved', ...
    where id = $1 and status = 'pending'
   returning player_id, outcome
 ), scored as (
-  update players p
-     set score = p.score + case when s.outcome = 'win' then 1 else -1 end
-    from settled s where p.id = s.player_id
-  returning p.score
+  update players
+     set score = score + ...
+    from settled
+   where players.id = settled.player_id
 )
-select (select count(*) from settled)::int, (select score from scored)
+...
 ```
 
-The score change is *driven by the rows the status update actually returned*. There
-is no window between "check the status" and "add a point" where a second request
-could fit. Both CTEs are one statement, so they commit together or not at all.
+The score update depends on the row returned by the status update. If another
+request settled the prediction first, `settled` is empty and no score changes.
+Both updates are part of one statement, so they commit together.
 
-That property is what lets me have three settlement callers — the scheduler, an
-opportunistic path, and an external cron hitting `POST /api/settle` — without
-worrying about them overlapping. A loser in a race gets `settled: false`, which is
-a normal outcome, not an error.
+This is why request polling, cron and the optional container scheduler can call
+the same sweep safely. Overlap may waste one provider call, but it cannot award
+points twice.
 
-### c) Deciding the rules — one pure function, ordered checks
+### Deciding whether a quote is usable
 
-`src/domain/rules.ts` → `decideSettlement`. The order matters and is deliberate:
+Open `decideSettlement` in `src/domain/rules.ts`.
 
-1. Has 60 seconds actually passed? (hard floor, checked first so a slow provider
-   during the countdown can't influence anything)
-2. Is there a quote at all? No quote means no known price — never fabricate one.
-3. Is the quote's timestamp sane (not from the future, not stale)?
-4. Is it genuinely *newer* than the entry quote? Timestamp, and trade id when
-   both sides have one.
-5. Has the price actually changed?
-6. Only then: score it.
+The checks are ordered from “not ready” to “safe to decide”:
 
-Every early return is a **named reason** (`price_unchanged`,
-`provider_unavailable`, `stale_quote`, …) which the UI turns into a sentence.
-That's why a waiting player sees "the price hasn't moved yet" instead of a
-spinner — the server knows why it's waiting, so it can say.
+1. the database-owned 60-second deadline has passed;
+2. a provider quote exists;
+3. its timestamp is not implausibly future-dated;
+4. it is no more than 30 seconds old;
+5. timestamp and trade ID place it after the entry quote;
+6. the price differs from the entry price.
 
-**One honest detail here.** While writing the tests I worked out that check 4's
-timestamp branch is *unreachable* with the current constants: a quote has to be
-within 30 seconds of now, the deadline is 60 seconds after creation, and the entry
-quote is at most a few seconds after creation — so anything that passes freshness
-is necessarily newer than the entry. I kept it as defence-in-depth for retuned
-constants, and the test says so explicitly rather than pretending it proves
-production behaviour. The **trade-id** guard is reachable, and it fired during
-development and caught a bug in my own test fixture, which was a good sign it
-isn't decorative.
+Only then does the function return a win or loss. Every other branch returns a
+named pending reason. Because the function accepts its clock and quote and has no
+I/O, boundary cases are quick to test.
 
----
+The same important rules also exist as database constraints. That duplication is
+intentional: TypeScript gives clear behaviour, while PostgreSQL prevents invalid
+state from being stored by any caller.
 
-## 5. Tests, trade-offs, next steps (4 minutes)
+## 5. Testing and evidence
 
-### What's actually verified
+The standard verification commands are:
 
 ```bash
-npm run typecheck   # clean
-npm run lint        # 0 errors, 0 warnings
-npm test            # 170 tests, all passing (16 October 2026)
-npm run build       # production build OK
-node scripts/smoke.mjs --expect-simulated   # 14/14 checks
+npm run typecheck
+npm run lint
+TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/bpg_test npm test
+npm run build
 ```
 
-- **Unit tests** (no database) cover the rules exhaustively: all four
-  win/loss combinations, the exact 60-second boundary, unchanged price, stale and
-  future-dated quotes, provider failure, and decimal comparison that a float
-  would get wrong.
-- **Integration tests** run against **real PostgreSQL**, because the guarantees
-  under test *are* database behaviour — a fake would let the suite pass while the
-  constraints were broken. They cover 20 concurrent creations (1 wins), 10
-  concurrent settlements (score moves once), two racing sweeps, and the schema
-  refusing an outcome that contradicts the price movement.
-- **HTTP tests** drive the real handlers with real `Request`/`Response` objects:
-  cookie issuance, cookie forgery rejection, `409` on duplicates, `503` when the
-  feed is down, `404`/`401`/`200` on the protected settle endpoint.
-- **The smoke script** runs the whole journey against a running server over HTTP,
-  including the part no unit test can prove: a prediction created now is settled
-  about a minute later with the score moved exactly once.
+The deployed-version pass on 16 October 2026 had 170 passing tests across 10
+files. The engineering-review branch later had 174 passing tests across the
+same 10 files.
 
-Two things I'd point out as evidence of the process rather than the outcome:
-the smoke test caught a real bug (`secondsRemaining` briefly reported 61 because
-the deadline is anchored to the database clock while `now` is read before the
-insert), and writing the constraint tests caught a genuine hole in my first
-`CHECK` — it would have allowed an **unchanged** price to be scored as a *loss*,
-because `(outcome='win') = (entry > entry)` is `true = false`… which is false, but
-`(outcome='loss')` isn't excluded by that biconditional either. The constraint now
-requires `settlement_price <> entry_price` as well.
+- Unit tests cover the settlement matrix, time boundaries, bad quotes, decimal
+  comparison, identity and Coinbase parsing.
+- Integration tests use real PostgreSQL for partial indexes, constraints and
+  concurrent updates.
+- HTTP tests cover cookies, validation, status codes, state recovery and the
+  protected cron endpoint.
+- `scripts/smoke.mjs` covers the complete HTTP journey in local/container mode.
 
-**Local/container restart recovery, demonstrated (not Vercel cron proof):** I created a prediction, killed the server
-before its window elapsed, waited past the deadline with the process down,
-confirmed the row was still `pending` in the database, then restarted. The boot
-sweep settled it immediately (`prediction_settled` in the logs), the score moved
-once, and the same cookie could play again. Nothing lives in process memory.
+Two failures are worth understanding because they changed the implementation:
 
-### Trade-offs — what I deliberately didn't do
+- The first outcome constraint could store an unchanged price as a loss. The
+  final version explicitly requires settlement and entry prices to differ.
+- The smoke test briefly saw `secondsRemaining: 61` because the handler time was
+  captured before PostgreSQL created the row. The view now clamps the display to
+  60; the database rule was already correct.
 
-- **No AWS.** The selected free deployment uses Vercel, Neon and cron-job.org.
-  This adds an explicit idle-settlement delay and requires cron verification.
-  The container remains an alternative; moving to AWS would require deployment
-  configuration and operational verification, not changes to the domain rules.
-- **No ORM.** The important query is a data-modifying CTE that updates two tables;
-  an ORM would have made it harder to read, not easier.
-- **No per-prediction timers.** They die on redeploy and strand the prediction
-  silently. A stateless sweep can't lose work.
-- **No rate limiting yet.** The unique index bounds the damage (you can't
-  accumulate predictions) but not request volume. Listed as a limitation.
-- **No leaderboard, accounts, history UI, charts.** Not asked for.
+Production checks also recorded two separate paths:
 
-### Limitations I'd volunteer before being asked
+- an active round settled after the 60-second floor through `/api/state`;
+- another due round received no state request, then cron-job.org called
+  `/api/settle`, Vercel returned 200 and Neon recorded settlement one second
+  later.
 
-1. **Idle settlement delay.** With no requests, the external 15-minute cron must
-   drive settlement. That path is verified in production. A later quote can
-   change the outcome, even though minimum-wait and scoring invariants hold.
-2. **Identity is integrity, not authentication.** The signature stops you
-   impersonating a specific player; it doesn't stop you clearing your cookie and
-   starting fresh. Scores aren't a competitive ranking.
-3. **A flat market can hold a prediction open indefinitely.**
-4. **Single venue**, not a cross-exchange index.
-5. **`players.score` isn't cross-checked against the prediction rows by a
-   constraint** (a `CHECK` can't span tables). It's derivable —
-   `count(wins) - count(losses)` — so a reconciliation job would be the next step.
+These checks prove that the current triggers work. They do not turn the
+15-minute fallback into an exact-time settlement mechanism.
 
-### With another day
+## 6. Trade-offs to volunteer
 
-Rate limiting on prediction creation; a reconciliation job; metrics instead of log
-lines (settlement latency, provider error rate, pending count); chunked sweeps and
-a dedicated worker once one tick can't clear the due batch; and a product decision
-about the flat-market case.
+- **Idle latency:** with no browser traffic, settlement waits for the next cron
+  run. A later quote can change the outcome.
+- **Flat market:** equality remains pending indefinitely unless the product adds
+  a draw or timeout rule.
+- **Anonymous identity:** the signature prevents impersonation, not new account
+  creation by clearing cookies.
+- **Single price venue:** Coinbase is not a market-wide index.
+- **Stored score:** it is auditable from prediction history but not continuously
+  reconciled by a separate job.
+- **No rate limit:** the pending-row constraint limits state growth per player,
+  not request volume.
+- **Polling still multiplies with active players:** active rounds poll every
+  three seconds. Idle polling is slower and hidden tabs pause, but this is not a
+  substitute for measured capacity limits or abuse controls.
+- **No creation idempotency key:** a retry receives `409` and current state; it
+  does not replay the original successful response.
+- **Limited browser automation:** the API and HTTP journey are covered, but a
+  focused Playwright suite would add confidence around focus, hydration and
+  mobile interaction.
 
-### Scale — the "10,000 players" question
+## 7. Likely questions
 
-The first thing that breaks isn't the database, it's the price API: N players
-polling every 3 seconds is N/3 upstream requests per second. That's already
-handled — the displayed price goes through a 2-second TTL cache
-(`src/server/prices/cached.ts`), and **entry and settlement prices never come from
-it**, because those decide points. That's the one place I was deliberate about
-promoting authority rather than letting a cache flag do it.
+### Why PostgreSQL instead of keeping everything in application code?
 
-After that: chunk the sweep by player ID and move settlement to a queue-driven
-worker, add per-player rate limits, and read the pending predictions from a
-replica if read load matters. None of that is needed at this size.
+The rules that matter under concurrency map directly to partial indexes,
+constraints and a conditional update. Keeping those rules only in a service
+would make them dependent on every caller checking correctly.
 
----
+### Why not use an ORM?
 
-## Likely questions, with grounded answers
+Most operations are small, and the important one is a data-modifying CTE. Raw
+SQL keeps that transaction visible. The trade-off is manual mapping and less
+help with ordinary CRUD.
 
-**Why this stack?**
-Next.js gives me one deployable process: route handlers for the API and React for
-the UI, so there's no second service to operate. Postgres because the correctness
-story *is* database features — partial unique indexes, `CHECK` constraints, a
-conditional update that moves a score atomically. If I'd used SQLite or an ORM
-over something simpler, I'd have had to reimplement those guarantees in
-application code, which is exactly where they'd be fragile.
+### What happens when Coinbase is unavailable?
 
-**Why not AWS?**
-Nothing here needs it. The requirements are a relational database, a process that
-stays alive, and an outbound HTTP call. Adding RDS plus App Runner plus a schedule
-would take most of the timebox and make no rule more reliable. The design doesn't
-block AWS — `POST /api/settle` exists precisely so an external scheduler can drive
-settlement instead of my in-process timer.
+Entry returns `503` and creates no prediction. Settlement leaves existing rows
+pending. Neither path invents a price or changes a score.
 
-**What happens when the price doesn't change?**
-It stays open. The rule says resolution requires the price to have changed, and
-says unchanged is neither a win nor a loss. So the player sees "the price hasn't
-moved yet" and we retry each sweep. It's the honest answer, and it's the reason
-`decideSettlement` returns a named `price_unchanged` reason rather than a silent
-pending state.
+### Is the game exactly one minute long?
 
-**How do you ensure fair settlement?**
-Four things, in order of importance. One: entry and settlement prices come from
-the same provider, and the recorded entry quote carries the provider's own
-timestamp. Two: the settlement quote must be strictly newer than the entry quote
-(timestamp and trade id). Three: settlement uses the database clock, so app/DB
-drift can't shift the 60-second window. Four: the player never supplies a price —
-only a direction. And unchanged or stale quotes aren't settled at all.
+No. One minute is the earliest valid resolution. Active polling normally
+triggers a sweep soon after that. An idle round may wait for the 15-minute cron.
 
-**What if the provider goes down?**
-Nothing bad happens to your point. If the feed is down at entry, no prediction is
-created (503, with a reason). If it's down at settlement, the prediction stays
-pending and the sweep retries; the score is untouched. That's `provider_unavailable`
-in `decideSettlement`, and it's covered by tests at both levels.
+### What would change at higher traffic?
 
-**What if the browser closes?**
-The prediction persists in PostgreSQL. On the chosen Vercel deployment, the
-15-minute external cron must run the sweep when there are no state requests.
-That path was verified with a production row, a POST 200 in Vercel logs, and no
-intervening state request. The earlier local/container restart test separately
-demonstrated boot recovery. Delayed quotes can produce a different result.
+Measure provider traffic, pending volume and settlement latency first. Likely
+changes are rate limiting, a dedicated worker, claimed or chunked batches,
+metrics and score reconciliation. Display caching already reduces Coinbase calls
+without allowing cached prices to decide a round.
 
-**What prevents duplicate predictions?**
-A partial unique index, not an application check. The service *also* checks, but
-that's for a nicer error message; the index is what makes it impossible under
-concurrency. Twenty parallel inserts → one row.
+### What deserves product clarification?
 
-**What prevents double scoring?**
-The score change is inside the same statement as the status change and is driven
-by the rows that statement actually returned. A second attempt matches zero rows
-and changes nothing. Ten concurrent settlements → score moves once.
+The exact settlement-price definition and flat-market behaviour. Choosing a
+historical price at exactly second 60 is a different product rule and would need
+a provider or stored market feed that can support it.
 
-**What would you change in a team?**
-I'd want the settlement policy reviewed by someone else before implementation,
-because it's the part where a small interpretation difference changes the product
-— "unchanged price" especially. And I'd want the schema constraints reviewed,
-since they encode business rules in a place people don't usually look. The rest is
-ordinary.
+## Closing
 
-**What would you do differently after feedback?**
-If someone told me the flat-market behaviour is bad UX, I'd treat that as a
-product decision rather than a bug: either add a maximum wait with a documented
-"no result" outcome, or make the market data source higher-resolution so a move is
-near-certain within a minute. I'd want the decision recorded rather than quietly
-changing the scoring.
+A concise ending:
+
+> The project is small, but the rules are enforced in the places that can
+> actually protect them. React displays authoritative state, the domain function
+> explains when a result is allowed, and PostgreSQL handles the concurrency and
+> atomicity. The main compromise is explicit: free serverless hosting can delay
+> idle settlement and therefore use a later price.
