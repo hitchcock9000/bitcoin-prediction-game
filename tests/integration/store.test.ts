@@ -1,3 +1,4 @@
+import { Pool } from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ActivePredictionExistsError, createGameStore } from '@/server/game/store';
 import {
@@ -7,6 +8,7 @@ import {
   newPlayerId,
   readPrediction,
   resetDatabase,
+  TEST_DATABASE_URL,
   testPool,
 } from '../helpers/db';
 
@@ -57,6 +59,62 @@ describe('game store (real PostgreSQL)', () => {
       }
       const { rows } = await testPool().query('select count(*)::int as n from players');
       expect(rows[0].n).toBe(1);
+    });
+
+    it('reads the player with a fresh snapshot after a concurrent insert commits', async () => {
+      const playerId = newPlayerId();
+      const blocker = await testPool().connect();
+      const competingPool = new Pool({ connectionString: TEST_DATABASE_URL, max: 1 });
+      const competing = await competingPool.connect();
+      let blockerTransactionOpen = false;
+      let competingTransactionOpen = false;
+      let pendingEnsure: Promise<Awaited<ReturnType<typeof store.ensurePlayer>>> | null = null;
+
+      try {
+        const blockerPid = Number((await blocker.query('select pg_backend_pid() as pid')).rows[0].pid);
+
+        await blocker.query('begin');
+        blockerTransactionOpen = true;
+        await blocker.query('insert into players (id) values ($1)', [playerId]);
+
+        // Pin the competing query to one PostgreSQL backend even when the test
+        // URL points through a transaction pooler. That makes lock observation
+        // deterministic rather than timing-dependent.
+        await competing.query('begin');
+        competingTransactionOpen = true;
+        const competingPid = Number((await competing.query('select pg_backend_pid() as pid')).rows[0].pid);
+        pendingEnsure = createGameStore(competing).ensurePlayer(playerId);
+
+        let insertIsBlocked = false;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const { rows } = await blocker.query(
+            `select $1::int = any(pg_blocking_pids($2::int)) as blocked`,
+            [blockerPid, competingPid],
+          );
+          if (rows[0].blocked) {
+            insertIsBlocked = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(insertIsBlocked).toBe(true);
+
+        await blocker.query('commit');
+        blockerTransactionOpen = false;
+
+        const player = await pendingEnsure;
+        expect(player.id).toBe(playerId);
+        expect(player.score).toBe(0);
+        await competing.query('commit');
+        competingTransactionOpen = false;
+      } finally {
+        if (blockerTransactionOpen) await blocker.query('rollback');
+        await pendingEnsure?.catch(() => undefined);
+        if (competingTransactionOpen) await competing.query('rollback');
+        competing.release();
+        blocker.release();
+        await competingPool.end();
+      }
     });
   });
 

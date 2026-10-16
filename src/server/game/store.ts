@@ -63,15 +63,17 @@ export interface SettlementOutcome {
   newScore: number | null;
 }
 
-export function createGameStore(pool: Pool) {
+export function createGameStore(pool: Pick<Pool, 'query'>) {
   return {
     /**
      * Returns the player, creating them with a score of zero on first sight.
      *
-     * One statement, and no write on the hot path once the player exists:
+     * Normally one statement, and no write on the hot path once the player exists:
      * `on conflict do nothing` makes the insert a no-op, and the union falls
      * back to the existing row. This keeps a polling UI from generating write
-     * traffic every few seconds.
+     * traffic every few seconds. A concurrent insert can commit after this
+     * statement's snapshot was taken, though, so the rare zero-row result gets
+     * one separate read with a fresh snapshot.
      */
     async ensurePlayer(playerId: string): Promise<PlayerRecord> {
       const { rows } = await pool.query(
@@ -87,7 +89,14 @@ export function createGameStore(pool: Pool) {
         [playerId],
       );
 
-      const row = rows[0];
+      let row = rows[0];
+      if (!row) {
+        const fallback = await pool.query(
+          `select id, score, created_at from players where id = $1`,
+          [playerId],
+        );
+        row = fallback.rows[0];
+      }
       if (!row) throw new Error(`Failed to ensure player ${playerId}`);
       return mapPlayer(row);
     },
